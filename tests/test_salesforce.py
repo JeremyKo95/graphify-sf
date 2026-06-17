@@ -8,6 +8,7 @@ from pathlib import Path
 
 import networkx as nx
 
+from graphify.salesforce import extract_sf
 from graphify.salesforce.apex_enhanced import extract_apex_enhanced
 from graphify.salesforce.constants import sobject_nid
 from graphify.salesforce.cpq import cpq_analysis_pass
@@ -1031,3 +1032,140 @@ def test_release_sync(tmp_path, monkeypatch) -> None:
     )
     changed = sync_release_notes(tmp_path / "changed")
     assert changed["changed"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Integration: extract_sf() E2E + backwards compatibility (Phase 3, Step 2)
+# ---------------------------------------------------------------------------
+
+SAMPLE_ORG = FIXTURES / "sf_full_org_sample" / "force-app" / "main" / "default"
+
+
+class TestExtractSF:
+    """E2E integration tests for the ``extract_sf`` pipeline wrapper."""
+
+    def test_full_org_sample(self) -> None:
+        """``extract_sf`` parses a complete sample org and runs every pass.
+
+        Sample org (tests/fixtures/sf_full_org_sample/force-app/main/default):
+            - classes/   5 Apex files (incl. a QCP plugin + triggers)
+            - flows/     3 Flow files
+            - objects/   2 Custom Object files
+            - lwc/       1 LWC component pair (html + js)
+            - profiles/  1 Profile
+        """
+        result = extract_sf(SAMPLE_ORG)
+
+        # 1. No top-level error.
+        assert "error" not in result
+
+        nodes = result["nodes"]
+        edges = result["edges"]
+
+        # 2. All expected node types are present.
+        file_types = {n["file_type"] for n in nodes}
+        expected_types = {"code", "sobject", "flow", "lwc_component", "profile"}
+        assert expected_types.issubset(file_types), file_types
+
+        # 3. Cross-file resolution: every parser that touches Account converges
+        #    on the single ``sobject_nid("Account")`` node (ADR-002).
+        account_nodes = [n for n in nodes if n.get("label") == "Account"]
+        assert len(account_nodes) == 1
+        assert account_nodes[0]["id"] == sobject_nid("Account")
+        assert account_nodes[0]["file_type"] == "sobject"
+
+        # 4. No dangling edges — every endpoint resolves to a real node.
+        node_ids = {n["id"] for n in nodes}
+        for edge in edges:
+            assert edge["source"] in node_ids, f"dangling source: {edge}"
+            assert edge["target"] in node_ids, f"dangling target: {edge}"
+
+        # 5. Analysis passes ran on the merged graph -------------------------
+
+        # 5a. CPQ pass detected the QCP plugin and emitted callback nodes.
+        qcp_methods = [n for n in nodes if n.get("file_type") == "cpq_qcp_method"]
+        assert qcp_methods, "CPQ pass produced no QCP callback nodes"
+        qcp_classes = {n.get("sf_qcp_class") for n in qcp_methods}
+        assert any(
+            nodes_by_id := [n for n in nodes if n["id"] in qcp_classes]
+        )
+        assert any(n.get("sf_qcp_implementation") for n in nodes_by_id)
+
+        # 5b. LWC merge pass folded html + js into a single component node.
+        lwc_nodes = [n for n in nodes if n.get("file_type") == "lwc_component"]
+        assert len(lwc_nodes) == 1
+        assert lwc_nodes[0].get("sf_has_template") is True
+        # html sidecar node was removed by the merge.
+        assert not any(n.get("sf_lwc_file_type") == "html" for n in nodes)
+
+        # 5c. Cross-file LWC -> Apex resolution: @wire targets a real method.
+        wire_edges = [e for e in edges if e["relation"] == "wire_to"]
+        assert wire_edges
+        assert all(e["target"] in node_ids for e in wire_edges)
+
+        # 5d. Governor pass flagged the SOQL-in-loop in the trigger.
+        gov_edges = [e for e in edges if e.get("relation") == "governor_violation"]
+        assert gov_edges, "Governor pass produced no violation edges"
+        assert all(e["target"] in node_ids for e in gov_edges)
+        violation_types = {e.get("sf_violation_type") for e in gov_edges}
+        assert "soql_in_loop" in violation_types
+
+    def test_single_file_path(self) -> None:
+        """``extract_sf`` also accepts a single metadata file (not just a dir)."""
+        result = extract_sf(SAMPLE_ORG / "objects" / "Account.object-meta.xml")
+        assert "error" not in result
+        node_ids = {n["id"] for n in result["nodes"]}
+        assert sobject_nid("Account") in node_ids
+        for edge in result["edges"]:
+            assert edge["source"] in node_ids
+            assert edge["target"] in node_ids
+
+    def test_lenient_skips_unparseable_file(self, tmp_path) -> None:
+        """A malformed metadata file is skipped, not fatal (ADR-009 lenient)."""
+        good = tmp_path / "Account.object-meta.xml"
+        good.write_text(
+            (SAMPLE_ORG / "objects" / "Account.object-meta.xml").read_text(
+                encoding="utf-8"
+            ),
+            encoding="utf-8",
+        )
+        # The flow parser will see broken XML; the run must still succeed.
+        bad = tmp_path / "Broken.flow-meta.xml"
+        bad.write_text("<Flow><unclosed></Flow>", encoding="utf-8")
+
+        result = extract_sf(tmp_path)
+        assert "error" not in result
+        node_ids = {n["id"] for n in result["nodes"]}
+        assert sobject_nid("Account") in node_ids
+
+
+class TestBackwardsCompatibility:
+    """Existing language support must keep working alongside the SF parsers."""
+
+    def test_existing_apex_dispatch_present(self) -> None:
+        """The core ``.cls`` dispatch entry still exists (no regression)."""
+        from graphify.extract import _DISPATCH
+
+        assert ".cls" in _DISPATCH
+        assert ".trigger" in _DISPATCH
+
+    def test_register_patches_sf_parsers(self) -> None:
+        """``register()`` wires the SF metadata suffixes into ``_DISPATCH``."""
+        import graphify.salesforce as sf
+        from graphify.extract import _DISPATCH
+
+        sf.register()
+        for suffix in (".flow-meta.xml", ".object-meta.xml", ".profile-meta.xml"):
+            assert suffix in _DISPATCH
+
+    def test_languages_test_suite(self) -> None:
+        """Run the existing language test suite to verify no regression."""
+        import subprocess
+        import sys
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "tests/test_languages.py", "-q"],
+            capture_output=True,
+            cwd=str(Path(__file__).parent.parent),
+        )
+        assert proc.returncode == 0, proc.stdout.decode() + proc.stderr.decode()

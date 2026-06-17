@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <apiVersion>59.0</apiVersion>
+    <decisions>
+        <name>Decision1</name>
+        <label>Check Amount</label>
+    </decisions>
+    <elements>
+        <name>Get_Accounts</name>
+        <type>recordLookup</type>
+        <targetObject>Account</targetObject>
+    </elements>
+    <elements>
+        <name>Call_Apex</name>
+        <type>apexAction</type>
+        <apexClass>AccountService</apexClass>
+    </elements>
+    <elements>
+        <name>Create_Opportunity</name>
+        <type>recordCreate</type>
+        <object>Opportunity</object>
+    </elements>
+    <start>
+        <connector>
+            <targetReference>Decision1</targetReference>
+        </connector>
+        <object>Account</object>
+        <recordTriggerType>CreateAndUpdate</recordTriggerType>
+    </start>
+</Flow>
