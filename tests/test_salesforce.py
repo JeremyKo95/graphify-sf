@@ -13,6 +13,12 @@ from graphify.salesforce.flow import extract_flow
 from graphify.salesforce.flow_cpq_loops import detect_flow_cpq_loops
 from graphify.salesforce.governor_limits import governor_limit_analysis_pass
 from graphify.salesforce.lwc import extract_lwc_html, extract_lwc_js
+from graphify.salesforce.neo4j_sf import (
+    SF_NODE_TYPE_TO_NEO4J_LABEL,
+    SF_RELATION_TO_NEO4J_TYPE,
+    push_to_neo4j_sf,
+    to_cypher_sf,
+)
 from graphify.salesforce.objects import extract_custom_object
 from graphify.salesforce.order_of_execution import ooe_analysis_pass
 from graphify.salesforce.permission_analysis import permission_analysis_pass
@@ -832,3 +838,141 @@ def test_objects_parser_xml_parse_error(tmp_path: Path) -> None:
     err = result["nodes"][0]
     assert err["file_type"] == "concept"
     assert err["sf_error_type"] == "xml_parse_error"
+
+
+# ---------------------------------------------------------------------------
+# Neo4j export (Cypher generation + live driver push)
+# ---------------------------------------------------------------------------
+
+
+def _sf_neo4j_graph() -> nx.DiGraph:
+    """A small SF graph exercising every node type and relation mapping."""
+    account_id = sobject_nid("Account")
+    quote_id = sobject_nid("SBQQ__Quote__c")
+    G = nx.DiGraph()
+    G.add_node(account_id, label="Account", file_type="sobject",
+               source_file="objects/Account.object-meta.xml")
+    G.add_node(quote_id, label="SBQQ__Quote__c", file_type="cpq_rule",
+               source_file="objects/SBQQ__Quote__c.object-meta.xml")
+    G.add_node("apex_accountservice", label="AccountService", file_type="code",
+               source_file="classes/AccountService.cls")
+    G.add_node("flow_accountflow", label="AccountFlow", file_type="flow",
+               source_file="flows/AccountFlow.flow-meta.xml")
+    G.add_node("lwc_accountcard", label="accountCard", file_type="lwc_component",
+               source_file="lwc/accountCard")
+    G.add_node("profile_admin", label="Admin", file_type="profile",
+               source_file="profiles/Admin.profile-meta.xml")
+    G.add_node("gov_limit_soql_in_loop", label="SOQL in loop", file_type="concept")
+
+    G.add_edge("apex_accountservice", account_id, relation="queries",
+               confidence="EXTRACTED", sf_in_loop=True, source_location="L42")
+    G.add_edge("flow_accountflow", "apex_accountservice", relation="flow_invokes",
+               confidence="EXTRACTED")
+    G.add_edge("lwc_accountcard", "apex_accountservice", relation="wire_to",
+               confidence="EXTRACTED")
+    G.add_edge("profile_admin", account_id, relation="grants_access_to",
+               confidence="EXTRACTED")
+    G.add_edge("apex_accountservice", quote_id, relation="cpq_applies_to",
+               confidence="INFERRED", execution_order=4)
+    G.add_edge("apex_accountservice", "gov_limit_soql_in_loop",
+               relation="governor_violation", confidence="EXTRACTED",
+               sf_violation_type="soql_in_loop", sf_severity="HIGH")
+    # A second edge between the same pair would collapse in a DiGraph, so the
+    # trigger relation is carried by a dedicated SObject-less trigger node.
+    G.add_node("trigger_accounttrigger", label="AccountTrigger", file_type="code",
+               source_file="triggers/AccountTrigger.trigger")
+    G.add_edge("trigger_accounttrigger", account_id, relation="triggers_on",
+               confidence="EXTRACTED")
+    return G
+
+
+def test_neo4j_export(tmp_path: Path) -> None:
+    """to_cypher_sf writes Neo4j-import-ready MERGE statements for SF graphs."""
+    G = _sf_neo4j_graph()
+    out = tmp_path / "graph_sf.cypher"
+
+    to_cypher_sf(G, str(out))
+
+    # 1. Cypher file is created and non-empty.
+    assert out.exists()
+    text = out.read_text(encoding="utf-8")
+    assert text.strip()
+
+    statements = [s for s in text.split(";") if s.strip()]
+    node_stmts = [s for s in statements if "MERGE (n:" in s]
+    rel_stmts = [s for s in statements if "MERGE (a)" in s]
+
+    # 2. Every node yields a MERGE statement with the SF-aware Neo4j label.
+    assert len(node_stmts) == G.number_of_nodes()
+    assert ":SObject " in text       # sobject -> SObject
+    assert ":ApexClass " in text     # code -> ApexClass
+    assert ":Flow " in text          # flow -> Flow
+    assert ":LWCComponent " in text  # lwc_component -> LWCComponent
+    assert ":CPQRule " in text       # cpq_rule -> CPQRule
+    assert ":Profile " in text       # profile -> Profile
+    assert ":Concept " in text       # concept -> Concept
+
+    # 3. Every edge yields a relationship MERGE with the SF-aware Neo4j type.
+    assert len(rel_stmts) == G.number_of_edges()
+    for neo_type in ("TRIGGERS_ON", "QUERIES", "FLOW_INVOKES", "WIRE_TO",
+                     "GRANTS_ACCESS_TO", "CPQ_APPLIES_TO", "GOVERNOR_VIOLATION"):
+        assert f":{neo_type} " in text or f":{neo_type}]" in text, neo_type
+
+    # 4. Mapping tables cover the declared SF vocabulary.
+    assert SF_NODE_TYPE_TO_NEO4J_LABEL["sobject"] == "SObject"
+    assert SF_RELATION_TO_NEO4J_TYPE["triggers_on"] == "TRIGGERS_ON"
+
+    # 5. Edge attributes are carried into the relationship.
+    assert "execution_order" in text
+    assert "sf_violation_type" in text
+
+
+def test_neo4j_push_live(monkeypatch) -> None:
+    """push_to_neo4j_sf upserts every node/edge via a (mocked) driver session."""
+    import sys
+    import types
+
+    runs: list[str] = []
+
+    class _FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def run(self, query, **params):
+            runs.append(query)
+
+    class _FakeDriver:
+        def __init__(self):
+            self.closed = False
+
+        def session(self):
+            return _FakeSession()
+
+        def close(self):
+            self.closed = True
+
+    class _FakeGraphDatabase:
+        @staticmethod
+        def driver(uri, auth=None):
+            return _FakeDriver()
+
+    fake_neo4j = types.ModuleType("neo4j")
+    fake_neo4j.GraphDatabase = _FakeGraphDatabase
+    monkeypatch.setitem(sys.modules, "neo4j", fake_neo4j)
+
+    G = _sf_neo4j_graph()
+    result = push_to_neo4j_sf(G, "bolt://localhost:7687", "neo4j", "pw")
+
+    assert result["success"] is True
+    assert result["nodes_created"] == G.number_of_nodes()
+    assert result["relationships_created"] == G.number_of_edges()
+    # One MERGE per node + one per edge.
+    assert len(runs) == G.number_of_nodes() + G.number_of_edges()
+    # SF-aware labels reach the driver in node MERGE queries.
+    assert any(":SObject" in q for q in runs)
+    assert any(":CPQRule" in q for q in runs)
+    # SF-aware relation types reach the driver in edge MERGE queries.
+    assert any(":TRIGGERS_ON" in q for q in runs)
