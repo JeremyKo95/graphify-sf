@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 VALID_FILE_TYPES = {"code", "document", "paper", "image", "rationale", "concept",
-                    "sobject", "flow", "lwc_component", "profile", "permission_set", "cpq_rule", "aura_component"}
+                    "sobject", "flow", "lwc_component", "profile", "permission_set", "cpq_rule", "cpq_qcp_method", "aura_component"}
 VALID_CONFIDENCES = {"EXTRACTED", "INFERRED", "AMBIGUOUS"}
 REQUIRED_NODE_FIELDS = {"id", "label", "file_type", "source_file"}
 REQUIRED_EDGE_FIELDS = {"source", "target", "relation", "confidence", "source_file"}

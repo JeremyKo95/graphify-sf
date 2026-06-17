@@ -6,6 +6,7 @@ from pathlib import Path
 
 from graphify.salesforce.apex_enhanced import extract_apex_enhanced
 from graphify.salesforce.constants import sobject_nid
+from graphify.salesforce.cpq import cpq_analysis_pass
 from graphify.salesforce.flow import extract_flow
 from graphify.salesforce.lwc import extract_lwc_html, extract_lwc_js
 from graphify.salesforce.objects import extract_custom_object
@@ -326,6 +327,123 @@ def test_flow_parser_xml_parse_error(tmp_path: Path) -> None:
     err = result["nodes"][0]
     assert err["file_type"] == "concept"
     assert err["sf_error_type"] == "xml_parse_error"
+
+
+def test_cpq_analysis() -> None:
+    """CPQ analysis pass: reclassify SBQQ__, detect QCP, order applies-to edges."""
+    # Parse the QCP plugin -> a "code" node carrying its source (QCP detection input).
+    qcp_result = extract_apex_enhanced(FIXTURES / "sf_QCPPlugin.cls")
+    assert "error" not in qcp_result
+
+    all_nodes: list[dict] = list(qcp_result["nodes"])
+    all_edges: list[dict] = list(qcp_result["edges"])
+    qcp_class_id = "apex_sf_qcpplugin"
+
+    # CPQ rule nodes (labels carry the SBQQ__ prefix) + a plain SObject that must
+    # NOT be reclassified.
+    all_nodes.append(
+        {
+            "id": "cpq_price_rule",
+            "label": "SBQQ__PriceRule__c Discount",
+            "file_type": "sobject",
+            "source_file": "objects/SBQQ__PriceRule__c.object-meta.xml",
+        }
+    )
+    all_nodes.append(
+        {
+            "id": "cpq_product_rule",
+            "label": "SBQQ__ProductRule__c Bundle",
+            "file_type": "sobject",
+            "source_file": "objects/SBQQ__ProductRule__c.object-meta.xml",
+        }
+    )
+    quote_id = sobject_nid("SBQQ__Quote__c")
+    all_nodes.append(
+        {
+            "id": quote_id,
+            "label": "SBQQ__Quote__c",
+            "file_type": "sobject",
+            "source_file": "objects/SBQQ__Quote__c.object-meta.xml",
+        }
+    )
+    account_id = sobject_nid("Account")
+    all_nodes.append(
+        {
+            "id": account_id,
+            "label": "Account",
+            "file_type": "sobject",
+            "source_file": "objects/Account.object-meta.xml",
+        }
+    )
+
+    all_edges.append(
+        {
+            "source": "cpq_price_rule",
+            "target": quote_id,
+            "relation": "cpq_applies_to",
+            "confidence": "INFERRED",
+            "source_file": "x",
+        }
+    )
+    all_edges.append(
+        {
+            "source": "cpq_product_rule",
+            "target": quote_id,
+            "relation": "cpq_applies_to",
+            "confidence": "INFERRED",
+            "source_file": "x",
+        }
+    )
+
+    nodes_before = len(all_nodes)
+    edges_before = len(all_edges)
+    input_nodes_obj = all_nodes
+    input_edges_obj = all_edges
+
+    result = cpq_analysis_pass(all_nodes, all_edges)
+
+    # In-place contract: returns None, mutates the same list objects.
+    assert result is None
+    assert all_nodes is input_nodes_obj
+    assert all_edges is input_edges_obj
+    assert len(all_edges) == edges_before  # pass adds no edges
+
+    by_id = {n["id"]: n for n in all_nodes}
+
+    # 1. SBQQ__ nodes reclassified to cpq_rule
+    assert by_id["cpq_price_rule"]["file_type"] == "cpq_rule"
+    assert by_id["cpq_price_rule"]["sf_cpq_object"] == "SBQQ__PriceRule__c Discount"
+    assert by_id["cpq_product_rule"]["file_type"] == "cpq_rule"
+    assert by_id[quote_id]["file_type"] == "cpq_rule"
+    # plain SObject untouched
+    assert by_id[account_id]["file_type"] == "sobject"
+
+    # 2. QCP interface implementation detected
+    assert by_id[qcp_class_id]["sf_qcp_implementation"] is True
+
+    # 4. QCP method nodes created (one per QCP method present in the source)
+    qcp_methods = [n for n in all_nodes if n.get("file_type") == "cpq_qcp_method"]
+    assert len(all_nodes) > nodes_before
+    qcp_method_names = {n["sf_qcp_method"] for n in qcp_methods}
+    assert {
+        "onBeforePriceRules",
+        "calculate",
+        "onAfterPriceRules",
+        "onAfterCalculate",
+    } <= qcp_method_names
+    # onBeforeCalculate is not implemented in the fixture -> no node
+    assert "onBeforeCalculate" not in qcp_method_names
+    for m in qcp_methods:
+        assert m["sf_qcp_class"] == qcp_class_id
+        assert m["source_file"] == by_id[qcp_class_id]["source_file"]
+
+    # 3. execution_order added to cpq_applies_to edges, existing attrs preserved
+    applies = [e for e in all_edges if e["relation"] == "cpq_applies_to"]
+    price_edge = next(e for e in applies if e["source"] == "cpq_price_rule")
+    product_edge = next(e for e in applies if e["source"] == "cpq_product_rule")
+    assert price_edge["execution_order"] == 2  # Price Rules
+    assert product_edge["execution_order"] == 1  # Product Rules
+    assert price_edge["confidence"] == "INFERRED"  # not overwritten
 
 
 def test_objects_parser_xml_parse_error(tmp_path: Path) -> None:

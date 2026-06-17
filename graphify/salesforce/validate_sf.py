@@ -31,6 +31,7 @@ SF_FILE_TYPES = {
     "profile",          # Profile (user permissions)
     "permission_set",   # Permission Set
     "cpq_rule",         # CPQ Price/Product Rule object
+    "cpq_qcp_method",   # QCP Calc Engine callback node (ADR-025)
     "aura_component",   # Aura Component (legacy)
     "validation_rule",  # Validation Rule (ADR-030)
 }
