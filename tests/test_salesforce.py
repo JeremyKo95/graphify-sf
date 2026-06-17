@@ -14,6 +14,7 @@ from graphify.salesforce.governor_limits import governor_limit_analysis_pass
 from graphify.salesforce.lwc import extract_lwc_html, extract_lwc_js
 from graphify.salesforce.objects import extract_custom_object
 from graphify.salesforce.order_of_execution import ooe_analysis_pass
+from graphify.salesforce.permission_analysis import permission_analysis_pass
 from graphify.salesforce.profiles import extract_permission_set, extract_profile
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -632,6 +633,85 @@ def test_governor_analysis() -> None:
     governor_limit_analysis_pass(all_nodes, all_edges)
     sentinels_2 = [n for n in all_nodes if str(n["id"]).startswith("gov_limit_")]
     assert len(sentinels_2) == 2
+
+
+def test_permission_analysis() -> None:
+    """Permission pass: FLS-restricted SBQQ__ fields on CPQ objects -> risk edges.
+
+    Cross-analyzes Profile/PermSet Field-Level Security (``sf_fls_permissions``)
+    against ``cpq_rule`` nodes: a non-readable ``SBQQ__`` field whose object is a
+    CPQ rule yields a ``gov_permission_violation`` risk edge (ADR-028). Only CPQ
+    (SBQQ__) fields are analyzed; readable fields and non-CPQ fields are ignored.
+    """
+    quote_id = "cpq_quote"
+    price_rule_id = "cpq_price_rule"
+
+    all_nodes: list[dict] = [
+        # CPQ rule nodes (post cpq_analysis_pass reclassification).
+        {"id": quote_id, "label": "SBQQ__Quote__c", "file_type": "cpq_rule",
+         "sf_cpq_object": "SBQQ__Quote__c",
+         "source_file": "objects/SBQQ__Quote__c.object-meta.xml"},
+        {"id": price_rule_id, "label": "SBQQ__PriceRule__c Discount",
+         "file_type": "cpq_rule", "sf_cpq_object": "SBQQ__PriceRule__c Discount",
+         "source_file": "objects/SBQQ__PriceRule__c.object-meta.xml"},
+        # An Admin profile restricting a CPQ field, plus an unrelated profile.
+        {"id": "profile_admin", "label": "Admin", "file_type": "profile",
+         "source_file": "profiles/Admin.profile-meta.xml",
+         "sf_fls_permissions": {
+             # Restricted CPQ field on a CPQ object -> risk.
+             "SBQQ__Quote__c.SBQQ__NetPrice__c": {"readable": False, "editable": False},
+             # Readable CPQ field -> no risk.
+             "SBQQ__Quote__c.SBQQ__ListPrice__c": {"readable": True, "editable": True},
+             # Non-CPQ field (no SBQQ__) -> ignored even if restricted.
+             "Account.BillingCity": {"readable": False, "editable": False},
+         }},
+        {"id": "permission_set_sales", "label": "Sales",
+         "file_type": "permission_set",
+         "source_file": "permissionsets/Sales.permissionset-meta.xml"},
+    ]
+    all_edges: list[dict] = []
+
+    input_nodes_obj = all_nodes
+    input_edges_obj = all_edges
+    nodes_before = len(all_nodes)
+
+    risks = permission_analysis_pass(all_nodes, all_edges)
+
+    # Contract: pure function — returns risk edges, mutates neither list.
+    assert isinstance(risks, list)
+    assert all_nodes is input_nodes_obj
+    assert all_edges is input_edges_obj
+    assert all_edges == []
+    assert len(all_nodes) == nodes_before
+
+    # 1. Exactly one risk edge: the restricted CPQ field on the Quote CPQ object.
+    assert len(risks) == 1
+    risk = risks[0]
+    assert risk["source"] == quote_id  # CPQ rule -> Profile (ADR-028)
+    assert risk["target"] == "profile_admin"
+    assert risk["relation"] == "gov_permission_violation"
+    assert risk["sf_risk_type"] == "fls_restricted"
+    assert risk["sf_field"] == "SBQQ__Quote__c.SBQQ__NetPrice__c"
+    assert risk["sf_severity"] == "HIGH"
+    assert risk["confidence"] == "INFERRED"
+    assert risk["confidence_value"] == 0.75
+
+    # 2. Readable CPQ field produced no risk; non-CPQ field ignored.
+    assert all(r["sf_field"] != "SBQQ__Quote__c.SBQQ__ListPrice__c" for r in risks)
+    assert all("Account" not in r["sf_field"] for r in risks)
+
+    # 3. The PriceRule CPQ object has no restricted field -> not a risk source.
+    assert all(r["source"] != price_rule_id for r in risks)
+
+    # 4. Risk edges reference existing nodes (no dangling once extended).
+    node_ids = {n["id"] for n in all_nodes}
+    for r in risks:
+        assert r["source"] in node_ids, f"dangling source: {r}"
+        assert r["target"] in node_ids, f"dangling target: {r}"
+
+    # Re-run safety: a pure pass yields identical edges (idempotent).
+    risks_2 = permission_analysis_pass(all_nodes, all_edges)
+    assert len(risks_2) == 1
 
 
 def test_objects_parser_xml_parse_error(tmp_path: Path) -> None:
