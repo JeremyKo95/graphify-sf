@@ -10,6 +10,7 @@ from graphify.salesforce.apex_enhanced import extract_apex_enhanced
 from graphify.salesforce.constants import sobject_nid
 from graphify.salesforce.cpq import cpq_analysis_pass
 from graphify.salesforce.flow import extract_flow
+from graphify.salesforce.governor_limits import governor_limit_analysis_pass
 from graphify.salesforce.lwc import extract_lwc_html, extract_lwc_js
 from graphify.salesforce.objects import extract_custom_object
 from graphify.salesforce.order_of_execution import ooe_analysis_pass
@@ -532,6 +533,105 @@ def test_ooe_analysis() -> None:
     ooe_nodes_2 = [n for n in all_nodes
                    if n.get("file_type") == "concept" and "sf_ooe_step" in n]
     assert len(ooe_nodes_2) == 36
+
+
+def test_governor_analysis() -> None:
+    """Governor pass: SOQL/DML-in-loop violations + one sentinel node per type.
+
+    The pass aggregates ``sf_in_loop`` ``queries`` / ``dml_operates_on`` edges
+    per offending method into ``governor_violation`` edges, and materializes one
+    sentinel ``concept`` node per violation type (ADR-004, no node explosion).
+    """
+    account_id = sobject_nid("Account")
+    contact_id = sobject_nid("Contact")
+
+    all_nodes: list[dict] = [
+        {"id": account_id, "label": "Account", "file_type": "sobject",
+         "source_file": "objects/Account.object-meta.xml"},
+        {"id": contact_id, "label": "Contact", "file_type": "sobject",
+         "source_file": "objects/Contact.object-meta.xml"},
+        {"id": "apex_loopservice", "label": "LoopService", "file_type": "code",
+         "source_file": "classes/LoopService.cls"},
+        {"id": "apex_dmlservice", "label": "DmlService", "file_type": "code",
+         "source_file": "classes/DmlService.cls"},
+        {"id": "apex_cleanservice", "label": "CleanService", "file_type": "code",
+         "source_file": "classes/CleanService.cls"},
+    ]
+    all_edges: list[dict] = [
+        # LoopService: two SOQL queries inside a loop -> one aggregated violation.
+        {"source": "apex_loopservice", "target": account_id, "relation": "queries",
+         "confidence": "EXTRACTED", "sf_in_loop": True, "source_location": "L42",
+         "source_file": "classes/LoopService.cls"},
+        {"source": "apex_loopservice", "target": contact_id, "relation": "queries",
+         "confidence": "EXTRACTED", "sf_in_loop": True, "source_location": "L45",
+         "source_file": "classes/LoopService.cls"},
+        # CleanService: a query NOT in a loop -> no violation.
+        {"source": "apex_cleanservice", "target": account_id, "relation": "queries",
+         "confidence": "EXTRACTED", "sf_in_loop": False, "source_location": "L10",
+         "source_file": "classes/CleanService.cls"},
+        # DmlService: a DML in a loop -> one DML violation.
+        {"source": "apex_dmlservice", "target": account_id,
+         "relation": "dml_operates_on", "confidence": "INFERRED", "sf_in_loop": True,
+         "source_location": "L87", "source_file": "classes/DmlService.cls"},
+    ]
+
+    nodes_before = len(all_nodes)
+    edges_before = len(all_edges)
+    input_nodes_obj = all_nodes
+    input_edges_obj = all_edges
+
+    violations = governor_limit_analysis_pass(all_nodes, all_edges)
+
+    # Contract: returns the diagnostic edges, mutates only all_nodes (sentinels).
+    assert isinstance(violations, list)
+    assert all_nodes is input_nodes_obj
+    assert all_edges is input_edges_obj
+    assert len(all_edges) == edges_before  # pass does not append edges itself
+
+    by_id = {n["id"]: n for n in all_nodes}
+
+    # 1. SOQL-in-loop detected for LoopService, aggregated (count == 2).
+    soql_v = [v for v in violations if v["sf_violation_type"] == "soql_in_loop"]
+    assert len(soql_v) == 1
+    soql_edge = soql_v[0]
+    assert soql_edge["source"] == "apex_loopservice"
+    assert soql_edge["target"] == "gov_limit_soql_in_loop"
+    assert soql_edge["relation"] == "governor_violation"
+    assert soql_edge["confidence"] == "EXTRACTED"
+    assert soql_edge["sf_violation_count"] == 2
+    assert soql_edge["sf_severity"] == "HIGH"
+    assert soql_edge["sf_limit"] == 100  # GOVERNOR_LIMITS soql_queries_per_transaction
+
+    # 2. DML-in-loop detected for DmlService.
+    dml_v = [v for v in violations if v["sf_violation_type"] == "dml_in_loop"]
+    assert len(dml_v) == 1
+    assert dml_v[0]["source"] == "apex_dmlservice"
+    assert dml_v[0]["target"] == "gov_limit_dml_in_loop"
+    assert dml_v[0]["sf_limit"] == 150
+
+    # CleanService's non-loop query produced no violation.
+    assert not any(v["source"] == "apex_cleanservice" for v in violations)
+
+    # 3. Exactly one sentinel node per violation type (no node explosion).
+    sentinels = [n for n in all_nodes if str(n["id"]).startswith("gov_limit_")]
+    assert {n["id"] for n in sentinels} == {
+        "gov_limit_soql_in_loop", "gov_limit_dml_in_loop"
+    }
+    assert len(sentinels) == 2
+    assert len(all_nodes) == nodes_before + 2
+    for s in sentinels:
+        assert s["file_type"] == "concept"
+
+    # 4. Violation edges reference existing nodes (no dangling once extended).
+    node_ids = {n["id"] for n in all_nodes}
+    for v in violations:
+        assert v["source"] in node_ids, f"dangling source: {v}"
+        assert v["target"] in node_ids, f"dangling target: {v}"
+
+    # Re-run safety: sentinels are not duplicated on a second pass.
+    governor_limit_analysis_pass(all_nodes, all_edges)
+    sentinels_2 = [n for n in all_nodes if str(n["id"]).startswith("gov_limit_")]
+    assert len(sentinels_2) == 2
 
 
 def test_objects_parser_xml_parse_error(tmp_path: Path) -> None:
