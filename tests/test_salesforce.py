@@ -6,6 +6,7 @@ from pathlib import Path
 
 from graphify.salesforce.apex_enhanced import extract_apex_enhanced
 from graphify.salesforce.constants import sobject_nid
+from graphify.salesforce.flow import extract_flow
 from graphify.salesforce.objects import extract_custom_object
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -123,6 +124,66 @@ def test_apex_parser() -> None:
     assert len(opp_dml) == 1
     assert opp_dml[0]["sf_in_loop"] is True
     assert opp_dml[0]["sf_dml_type"] == "UPDATE"
+
+
+def test_flow_parser() -> None:
+    fixture = FIXTURES / "sf_AccountFlow.flow-meta.xml"
+    result = extract_flow(fixture)
+
+    # 1. No error
+    assert "error" not in result
+
+    # 2. No dangling edges
+    _assert_no_dangling_edges(result)
+
+    # Flow node carries trigger metadata from <start>
+    flows = [n for n in result["nodes"] if n["file_type"] == "flow"]
+    assert len(flows) == 1
+    flow_node = flows[0]
+    assert flow_node["label"] == "sf_AccountFlow"
+    assert flow_node["sf_trigger_object"] == "Account"
+    assert flow_node["sf_trigger_type"] == "CreateAndUpdate"
+    flow_id = flow_node["id"]
+
+    # 3. recordLookup -> queries edge, target resolved via sobject_nid()
+    queries = [e for e in result["edges"] if e["relation"] == "queries"]
+    assert len(queries) == 1
+    q = queries[0]
+    assert q["source"] == flow_id
+    assert q["target"] == sobject_nid("Account")
+    assert q["confidence"] == "EXTRACTED"
+    assert q["sf_flow_element"] == "Get_Accounts"
+
+    # 4. recordCreate -> dml_operates_on edge (INSERT) to Opportunity
+    dml = [e for e in result["edges"] if e["relation"] == "dml_operates_on"]
+    assert len(dml) == 1
+    d = dml[0]
+    assert d["source"] == flow_id
+    assert d["target"] == sobject_nid("Opportunity")
+    assert d["sf_dml_type"] == "INSERT"
+    assert d["sf_flow_element"] == "Create_Opportunity"
+
+    # 5. apexAction -> flow_invokes edge to the Apex class
+    invokes = [e for e in result["edges"] if e["relation"] == "flow_invokes"]
+    assert len(invokes) == 1
+    inv = invokes[0]
+    assert inv["source"] == flow_id
+    assert inv["target"] == "apex_accountservice"
+    assert inv["sf_flow_element"] == "Call_Apex"
+
+
+def test_flow_parser_xml_parse_error(tmp_path: Path) -> None:
+    """Malformed Flow XML degrades gracefully to a single concept error node."""
+    bad = tmp_path / "Broken.flow-meta.xml"
+    bad.write_text("<Flow><start></Flow>")  # mismatched tag
+
+    result = extract_flow(bad)
+
+    assert result["edges"] == []
+    assert len(result["nodes"]) == 1
+    err = result["nodes"][0]
+    assert err["file_type"] == "concept"
+    assert err["sf_error_type"] == "xml_parse_error"
 
 
 def test_objects_parser_xml_parse_error(tmp_path: Path) -> None:
