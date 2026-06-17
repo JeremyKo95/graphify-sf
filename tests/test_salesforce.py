@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from graphify.salesforce.apex_enhanced import extract_apex_enhanced
 from graphify.salesforce.constants import sobject_nid
 from graphify.salesforce.objects import extract_custom_object
 
@@ -58,6 +59,70 @@ def test_objects_parser() -> None:
     assert ref["target"] == sobject_nid("Opportunity")
     assert ref["sf_relationship_type"] == "Lookup"
     assert ref["sf_field_api_name"] == "RelatedOpportunity__c"
+
+
+def test_apex_parser() -> None:
+    # --- Apex class: methods, SOQL (not in loop), DML --------------------
+    cls_result = extract_apex_enhanced(FIXTURES / "sf_AccountService.cls")
+
+    # 1. No error
+    assert "error" not in cls_result
+
+    # 2. No dangling edges
+    _assert_no_dangling_edges(cls_result)
+
+    # class node + sf_code_type
+    classes = [n for n in cls_result["nodes"] if n.get("sf_code_type") == "class"]
+    assert len(classes) == 1
+    assert classes[0]["label"] == "AccountService"
+
+    # method signatures parsed (getAccounts, updateAccount)
+    methods = [n for n in cls_result["nodes"] if n.get("sf_method_type") == "method"]
+    method_ids = {n["id"] for n in methods}
+    assert f"{classes[0]['id']}_getaccounts" in method_ids
+    assert f"{classes[0]['id']}_updateaccount" in method_ids
+    # each method -> class via calls edge
+    calls = [e for e in cls_result["edges"] if e["relation"] == "calls"]
+    assert all(e["target"] == classes[0]["id"] for e in calls)
+    assert len(calls) == len(methods)
+
+    # 3. SOQL detected (FROM Account), CRITICAL: target uses sobject_nid()
+    cls_queries = [e for e in cls_result["edges"] if e["relation"] == "queries"]
+    account_q = [e for e in cls_queries if e["target"] == sobject_nid("Account")]
+    assert len(account_q) == 1
+    # SOQL here sits *before* the loop -> not in loop
+    assert account_q[0]["sf_in_loop"] is False
+    assert account_q[0]["confidence"] == "EXTRACTED"
+
+    # 4. DML detected (update acc) and resolved to Account
+    cls_dml = [e for e in cls_result["edges"] if e["relation"] == "dml_operates_on"]
+    assert any(
+        e["target"] == sobject_nid("Account") and e["sf_dml_type"] == "UPDATE"
+        for e in cls_dml
+    )
+
+    # --- Apex trigger: SOQL/DML inside a loop ----------------------------
+    trig_result = extract_apex_enhanced(FIXTURES / "sf_AccountTrigger.trigger")
+
+    assert "error" not in trig_result
+    _assert_no_dangling_edges(trig_result)
+
+    triggers = [n for n in trig_result["nodes"] if n.get("sf_code_type") == "trigger"]
+    assert len(triggers) == 1
+    assert triggers[0]["label"] == "AccountTrigger"
+
+    # 5. SOQL inside the loop is tagged sf_in_loop: true
+    trig_queries = [e for e in trig_result["edges"] if e["relation"] == "queries"]
+    opp_q = [e for e in trig_queries if e["target"] == sobject_nid("Opportunity")]
+    assert len(opp_q) == 1
+    assert opp_q[0]["sf_in_loop"] is True
+
+    # DML inside the loop (update opps) also tagged in loop, resolved to Opportunity
+    trig_dml = [e for e in trig_result["edges"] if e["relation"] == "dml_operates_on"]
+    opp_dml = [e for e in trig_dml if e["target"] == sobject_nid("Opportunity")]
+    assert len(opp_dml) == 1
+    assert opp_dml[0]["sf_in_loop"] is True
+    assert opp_dml[0]["sf_dml_type"] == "UPDATE"
 
 
 def test_objects_parser_xml_parse_error(tmp_path: Path) -> None:
