@@ -10,6 +10,7 @@ from graphify.salesforce.apex_enhanced import extract_apex_enhanced
 from graphify.salesforce.constants import sobject_nid
 from graphify.salesforce.cpq import cpq_analysis_pass
 from graphify.salesforce.flow import extract_flow
+from graphify.salesforce.flow_cpq_loops import detect_flow_cpq_loops
 from graphify.salesforce.governor_limits import governor_limit_analysis_pass
 from graphify.salesforce.lwc import extract_lwc_html, extract_lwc_js
 from graphify.salesforce.objects import extract_custom_object
@@ -712,6 +713,111 @@ def test_permission_analysis() -> None:
     # Re-run safety: a pure pass yields identical edges (idempotent).
     risks_2 = permission_analysis_pass(all_nodes, all_edges)
     assert len(risks_2) == 1
+
+
+def test_flow_cpq_loops() -> None:
+    """Flow-CPQ loop pass: Type A (Direct) detection + safe-pattern downgrade.
+
+    A Record-Triggered Flow that performs DML on a Quote object re-triggers
+    itself once CPQ saves the recalculated Quote (ADR-029 Type A, CRITICAL). A
+    flow carrying a recursion-prevention marker is still reported but tagged
+    ``sf_loop_prevention`` and downgraded to INFO. Only Record-Triggered flows
+    that update a Quote object qualify; Screen flows and non-Quote DML are out.
+    """
+    quote_id = sobject_nid("SBQQ__Quote__c")
+    account_id = sobject_nid("Account")
+
+    all_nodes: list[dict] = [
+        {"id": quote_id, "label": "SBQQ__Quote__c", "file_type": "sobject",
+         "source_file": "objects/SBQQ__Quote__c.object-meta.xml"},
+        {"id": account_id, "label": "Account", "file_type": "sobject",
+         "source_file": "objects/Account.object-meta.xml"},
+        # Record-Triggered Flow updating Quote -> Type A direct loop (CRITICAL).
+        {"id": "flow_quotesync", "label": "QuoteSync", "file_type": "flow",
+         "source_file": "flows/QuoteSync.flow-meta.xml",
+         "sf_trigger_object": "SBQQ__Quote__c", "sf_trigger_type": "CreateAndUpdate"},
+        # Record-Triggered Flow updating Quote BUT guarded (isFirstRun) -> INFO.
+        {"id": "flow_quoteguard", "label": "QuoteGuard", "file_type": "flow",
+         "source_file": "flows/QuoteGuard.flow-meta.xml",
+         "sf_trigger_object": "SBQQ__Quote__c", "sf_trigger_type": "Update",
+         "sf_entry_conditions": "isFirstRun == true"},
+        # Record-Triggered Flow updating Account (not Quote) -> no loop.
+        {"id": "flow_accountnotify", "label": "AccountNotify", "file_type": "flow",
+         "source_file": "flows/AccountNotify.flow-meta.xml",
+         "sf_trigger_object": "Account", "sf_trigger_type": "Create"},
+        # Screen Flow (NOT record-triggered) updating Quote -> no Type A loop.
+        {"id": "flow_screenquote", "label": "ScreenQuote", "file_type": "flow",
+         "source_file": "flows/ScreenQuote.flow-meta.xml",
+         "sf_trigger_object": None, "sf_trigger_type": None},
+    ]
+    all_edges: list[dict] = [
+        {"source": "flow_quotesync", "target": quote_id,
+         "relation": "dml_operates_on", "sf_dml_type": "UPDATE",
+         "confidence": "EXTRACTED", "source_file": "flows/QuoteSync.flow-meta.xml"},
+        # Second Quote DML on the same flow -> must NOT create a second loop edge.
+        {"source": "flow_quotesync", "target": sobject_nid("SBQQ__QuoteLine__c"),
+         "relation": "dml_operates_on", "sf_dml_type": "UPDATE",
+         "confidence": "EXTRACTED", "source_file": "flows/QuoteSync.flow-meta.xml"},
+        {"source": "flow_quoteguard", "target": quote_id,
+         "relation": "dml_operates_on", "sf_dml_type": "UPDATE",
+         "confidence": "EXTRACTED", "source_file": "flows/QuoteGuard.flow-meta.xml"},
+        {"source": "flow_accountnotify", "target": account_id,
+         "relation": "dml_operates_on", "sf_dml_type": "UPDATE",
+         "confidence": "EXTRACTED", "source_file": "flows/AccountNotify.flow-meta.xml"},
+        {"source": "flow_screenquote", "target": quote_id,
+         "relation": "dml_operates_on", "sf_dml_type": "UPDATE",
+         "confidence": "EXTRACTED", "source_file": "flows/ScreenQuote.flow-meta.xml"},
+    ]
+
+    input_nodes_obj = all_nodes
+    input_edges_obj = all_edges
+    nodes_before = len(all_nodes)
+    edges_before = len(all_edges)
+
+    loops = detect_flow_cpq_loops(all_nodes, all_edges)
+
+    # Contract: pure function — returns loop edges, mutates neither list.
+    assert isinstance(loops, list)
+    assert all_nodes is input_nodes_obj
+    assert all_edges is input_edges_obj
+    assert len(all_nodes) == nodes_before
+    assert len(all_edges) == edges_before
+
+    by_source = {e["source"]: e for e in loops}
+
+    # 1. Flow -> Quote update detected; exactly two loops (sync + guard).
+    assert set(by_source) == {"flow_quotesync", "flow_quoteguard"}
+    assert len(loops) == 2  # quotesync deduped despite two Quote DML edges
+
+    # 2. Type A (Direct) loop for the unguarded flow -> CRITICAL self-edge.
+    sync = by_source["flow_quotesync"]
+    assert sync["source"] == sync["target"] == "flow_quotesync"  # self-loop
+    assert sync["relation"] == "infinite_loop_risk"
+    assert sync["confidence"] == "INFERRED"
+    assert sync["confidence_value"] == 0.85
+    assert sync["sf_loop_type"] == "A_DIRECT"
+    assert sync["sf_severity"] == "CRITICAL"
+    assert sync["sf_loop_prevention"] is False
+
+    # 3. Safe-pattern detected on the guarded flow -> downgraded to INFO.
+    guard = by_source["flow_quoteguard"]
+    assert guard["sf_loop_type"] == "A_DIRECT"
+    assert guard["sf_loop_prevention"] is True
+    assert guard["sf_severity"] == "INFO"
+
+    # 4. Non-Quote DML and Screen (non record-triggered) flows produce no loop.
+    assert "flow_accountnotify" not in by_source
+    assert "flow_screenquote" not in by_source
+
+    # 5. Self-edges reference existing nodes (no dangling once extended).
+    node_ids = {n["id"] for n in all_nodes}
+    for loop in loops:
+        assert loop["source"] in node_ids, f"dangling source: {loop}"
+        assert loop["target"] in node_ids, f"dangling target: {loop}"
+
+    # Re-run safety: a pure pass yields identical results (idempotent).
+    loops_2 = detect_flow_cpq_loops(all_nodes, all_edges)
+    assert len(loops_2) == 2
 
 
 def test_objects_parser_xml_parse_error(tmp_path: Path) -> None:

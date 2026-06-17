@@ -101,7 +101,7 @@ EDGE_ATTRIBUTES_BY_RELATION: dict[str, dict[str, list[str]]] = {
         "optional": ["sf_risk_level", "sf_overlapping_fields", "sf_note"],
     },
     "infinite_loop_risk": {
-        "optional": ["sf_loop_type", "sf_severity", "sf_reason"],
+        "optional": ["sf_loop_type", "sf_severity", "sf_reason", "sf_loop_prevention"],
     },
 }
 
