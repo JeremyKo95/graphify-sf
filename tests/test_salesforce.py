@@ -7,6 +7,7 @@ from pathlib import Path
 from graphify.salesforce.apex_enhanced import extract_apex_enhanced
 from graphify.salesforce.constants import sobject_nid
 from graphify.salesforce.flow import extract_flow
+from graphify.salesforce.lwc import extract_lwc_html, extract_lwc_js
 from graphify.salesforce.objects import extract_custom_object
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -170,6 +171,61 @@ def test_flow_parser() -> None:
     assert inv["source"] == flow_id
     assert inv["target"] == "apex_accountservice"
     assert inv["sf_flow_element"] == "Call_Apex"
+
+
+def test_lwc_parser() -> None:
+    # --- HTML template ---------------------------------------------------
+    html_result = extract_lwc_html(FIXTURES / "sf_MyComponent.html")
+
+    # 1. No error + no dangling edges
+    assert "error" not in html_result
+    _assert_no_dangling_edges(html_result)
+
+    html_nodes = [n for n in html_result["nodes"] if n["file_type"] == "lwc_component"]
+    assert len(html_nodes) == 1
+    assert html_nodes[0]["sf_lwc_file_type"] == "html"
+
+    # --- JavaScript ------------------------------------------------------
+    js_result = extract_lwc_js(FIXTURES / "sf_MyComponent.js")
+
+    # 1. No error + no dangling edges
+    assert "error" not in js_result
+    _assert_no_dangling_edges(js_result)
+
+    lwc_nodes = [n for n in js_result["nodes"] if n["file_type"] == "lwc_component"]
+    assert len(lwc_nodes) == 1
+    lwc_node = lwc_nodes[0]
+    assert lwc_node["label"] == "MyComponent"
+    assert lwc_node["sf_lwc_file_type"] == "js"
+
+    # 4. @api properties detected
+    assert lwc_node["sf_api_property_recordId"] is True
+    assert lwc_node["sf_api_property_label"] is True
+
+    # 2/3. @wire decorator -> wire_to edge to the Apex method node
+    wire_edges = [e for e in js_result["edges"] if e["relation"] == "wire_to"]
+    assert len(wire_edges) == 1
+    w = wire_edges[0]
+    assert w["source"] == lwc_node["id"]
+    # Resolves to the same Apex method node ID the Apex parser produces:
+    # apex_<class>_<method>  (AccountService.getAccounts)
+    assert w["target"] == "apex_accountservice_getaccounts"
+    assert w["sf_wire_method"] == "getAccounts"
+    assert w["confidence"] == "INFERRED"
+
+
+def test_lwc_parser_encoding_error(tmp_path: Path) -> None:
+    """Undecodable JS bytes degrade gracefully to a single concept error node."""
+    bad = tmp_path / "Broken.js"
+    bad.write_bytes(b"\xff\xfe invalid \x80 bytes")
+
+    result = extract_lwc_js(bad)
+
+    assert result["edges"] == []
+    assert len(result["nodes"]) == 1
+    err = result["nodes"][0]
+    assert err["file_type"] == "concept"
+    assert err["sf_error_type"] == "js_parse_error"
 
 
 def test_flow_parser_xml_parse_error(tmp_path: Path) -> None:
