@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import networkx as nx
+
 from graphify.salesforce.apex_enhanced import extract_apex_enhanced
 from graphify.salesforce.constants import sobject_nid
 from graphify.salesforce.cpq import cpq_analysis_pass
 from graphify.salesforce.flow import extract_flow
 from graphify.salesforce.lwc import extract_lwc_html, extract_lwc_js
 from graphify.salesforce.objects import extract_custom_object
+from graphify.salesforce.order_of_execution import ooe_analysis_pass
 from graphify.salesforce.profiles import extract_permission_set, extract_profile
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -444,6 +447,91 @@ def test_cpq_analysis() -> None:
     assert price_edge["execution_order"] == 2  # Price Rules
     assert product_edge["execution_order"] == 1  # Product Rules
     assert price_edge["confidence"] == "INFERRED"  # not overwritten
+
+
+def test_ooe_analysis() -> None:
+    """OoE pass: 18-step chain per triggered SObject, forming a DAG.
+
+    SObjects with an Apex trigger or a Validation Rule qualify; an SObject
+    referenced only by SOQL must NOT get an OoE chain (ADR-005 / ADR-017).
+    """
+    account_id = sobject_nid("Account")
+    contact_id = sobject_nid("Contact")
+    opp_id = sobject_nid("Opportunity")
+
+    all_nodes: list[dict] = [
+        {"id": account_id, "label": "Account", "file_type": "sobject",
+         "source_file": "objects/Account.object-meta.xml"},
+        {"id": contact_id, "label": "Contact", "file_type": "sobject",
+         "source_file": "objects/Contact.object-meta.xml"},
+        {"id": opp_id, "label": "Opportunity", "file_type": "sobject",
+         "source_file": "objects/Opportunity.object-meta.xml"},
+        {"id": "apex_accounttrigger", "label": "AccountTrigger",
+         "file_type": "code", "source_file": "triggers/AccountTrigger.trigger",
+         "sf_code_type": "trigger"},
+        {"id": "validation_contact_amount", "label": "ContactAmount",
+         "file_type": "validation_rule",
+         "source_file": "objects/Contact/ContactAmount.validationRule-meta.xml"},
+    ]
+    all_edges: list[dict] = [
+        # Account has a trigger -> qualifies for OoE
+        {"source": "apex_accounttrigger", "target": account_id,
+         "relation": "triggers_on", "confidence": "EXTRACTED", "source_file": "x"},
+        # Contact has a Validation Rule -> qualifies for OoE
+        {"source": "validation_contact_amount", "target": contact_id,
+         "relation": "validates", "confidence": "EXTRACTED", "source_file": "x"},
+        # Opportunity is referenced only by SOQL -> must NOT get OoE
+        {"source": "apex_accounttrigger", "target": opp_id, "relation": "queries",
+         "confidence": "EXTRACTED", "sf_in_loop": False, "source_file": "x"},
+    ]
+
+    nodes_before = len(all_nodes)
+    input_nodes_obj = all_nodes
+    input_edges_obj = all_edges
+
+    result = ooe_analysis_pass(all_nodes, all_edges)
+
+    # In-place contract: returns None, mutates the same list objects.
+    assert result is None
+    assert all_nodes is input_nodes_obj
+    assert all_edges is input_edges_obj
+
+    # 1. 18 OoE nodes per qualifying SObject (Account + Contact); none for Opportunity.
+    ooe_nodes = [n for n in all_nodes
+                 if n.get("file_type") == "concept" and "sf_ooe_step" in n]
+    assert len(ooe_nodes) == 36
+    assert len(all_nodes) == nodes_before + 36
+    account_ooe = [n for n in ooe_nodes if n["sf_ooe_sobject"] == account_id]
+    contact_ooe = [n for n in ooe_nodes if n["sf_ooe_sobject"] == contact_id]
+    assert len(account_ooe) == 18
+    assert len(contact_ooe) == 18
+    # SOQL-only Opportunity excluded.
+    assert not any(n["sf_ooe_sobject"] == opp_id for n in ooe_nodes)
+    # Steps numbered 1..18.
+    assert {n["sf_ooe_step"] for n in account_ooe} == set(range(1, 19))
+
+    # 2. order_of_execution edges chain the steps sequentially.
+    ooe_edges = [e for e in all_edges if e["relation"] == "order_of_execution"]
+    assert all(e["confidence"] == "EXTRACTED" for e in ooe_edges)
+    dag = nx.DiGraph((e["source"], e["target"]) for e in ooe_edges)
+    for i in range(1, 18):
+        assert dag.has_edge(f"ooe_{account_id}_{i}", f"ooe_{account_id}_{i + 1}")
+        assert dag.has_edge(f"ooe_{contact_id}_{i}", f"ooe_{contact_id}_{i + 1}")
+
+    # 3. The order_of_execution subgraph is a DAG (no cycle).
+    assert nx.is_directed_acyclic_graph(dag)
+
+    # No dangling edges introduced.
+    node_ids = {n["id"] for n in all_nodes}
+    for e in all_edges:
+        assert e["source"] in node_ids, f"dangling source: {e}"
+        assert e["target"] in node_ids, f"dangling target: {e}"
+
+    # Re-run safety: a second pass does not duplicate the chains.
+    ooe_analysis_pass(all_nodes, all_edges)
+    ooe_nodes_2 = [n for n in all_nodes
+                   if n.get("file_type") == "concept" and "sf_ooe_step" in n]
+    assert len(ooe_nodes_2) == 36
 
 
 def test_objects_parser_xml_parse_error(tmp_path: Path) -> None:
