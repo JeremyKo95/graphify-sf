@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from pathlib import Path
 
 import networkx as nx
@@ -23,6 +25,7 @@ from graphify.salesforce.objects import extract_custom_object
 from graphify.salesforce.order_of_execution import ooe_analysis_pass
 from graphify.salesforce.permission_analysis import permission_analysis_pass
 from graphify.salesforce.profiles import extract_permission_set, extract_profile
+from graphify.salesforce.release_sync import check_staleness, sync_release_notes
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -976,3 +979,55 @@ def test_neo4j_push_live(monkeypatch) -> None:
     assert any(":CPQRule" in q for q in runs)
     # SF-aware relation types reach the driver in edge MERGE queries.
     assert any(":TRIGGERS_ON" in q for q in runs)
+
+
+# ---------------------------------------------------------------------------
+# Release sync (Phase 3, Step 1)
+# ---------------------------------------------------------------------------
+
+
+def test_release_sync(tmp_path, monkeypatch) -> None:
+    """sync_release_notes writes a version file, detects staleness, dry-runs."""
+    import graphify.salesforce.release_sync as rs
+
+    # 1. Normal run writes a well-formed JSON version file.
+    result = sync_release_notes(tmp_path)
+    version_file = tmp_path / "sf_governor_limits_version.json"
+    assert version_file.exists()
+
+    data = json.loads(version_file.read_text(encoding="utf-8"))
+    assert data["version"] == result["version"]
+    assert isinstance(data["limits"], dict) and data["limits"]
+    # last_synced is a valid ISO timestamp.
+    datetime.fromisoformat(data["last_synced"])
+
+    # Return contract.
+    assert set(result) >= {"changed", "new_limits", "version", "days_stale", "status"}
+    # Offline default mirrors hardcoded constants -> no drift.
+    assert result["changed"] == 0
+    assert result["status"] in {"FRESH", "WARNING", "ERROR"}
+
+    # 2. Staleness is detected from the written file (FRESH right after write).
+    staleness = check_staleness(version_file)
+    assert staleness["days_stale"] == 0
+    assert staleness["status"] == "FRESH"
+
+    # Threshold mapping is correct at the WARNING / ERROR boundaries.
+    assert rs._staleness_status(0) == "FRESH"
+    assert rs._staleness_status(30) == "FRESH"
+    assert rs._staleness_status(31) == "WARNING"
+    assert rs._staleness_status(90) == "WARNING"
+    assert rs._staleness_status(91) == "ERROR"
+
+    # 3. --dry-run previews without writing a file.
+    fresh_dir = tmp_path / "dry"
+    dry = sync_release_notes(fresh_dir, dry_run=True)
+    assert dry["dry_run"] is True
+    assert not (fresh_dir / "sf_governor_limits_version.json").exists()
+
+    # 4. A drift in the fetched limits is counted as a change (mock backend).
+    monkeypatch.setattr(
+        rs, "_fetch_release_limits", lambda: {"soql_queries_per_transaction": 200}
+    )
+    changed = sync_release_notes(tmp_path / "changed")
+    assert changed["changed"] >= 1
