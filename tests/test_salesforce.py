@@ -9,6 +9,7 @@ from graphify.salesforce.constants import sobject_nid
 from graphify.salesforce.flow import extract_flow
 from graphify.salesforce.lwc import extract_lwc_html, extract_lwc_js
 from graphify.salesforce.objects import extract_custom_object
+from graphify.salesforce.profiles import extract_permission_set, extract_profile
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -212,6 +213,91 @@ def test_lwc_parser() -> None:
     assert w["target"] == "apex_accountservice_getaccounts"
     assert w["sf_wire_method"] == "getAccounts"
     assert w["confidence"] == "INFERRED"
+
+
+def test_profile_parser() -> None:
+    fixture = FIXTURES / "sf_Admin.profile-meta.xml"
+    result = extract_profile(fixture)
+
+    # 1. No error
+    assert "error" not in result
+
+    # 2. No dangling edges
+    _assert_no_dangling_edges(result)
+
+    # Profile node
+    profiles = [n for n in result["nodes"] if n["file_type"] == "profile"]
+    assert len(profiles) == 1
+    profile_node = profiles[0]
+    assert profile_node["id"] == "profile_sf_admin"
+    assert profile_node["label"] == "sf_Admin"
+    profile_id = profile_node["id"]
+
+    grants = [e for e in result["edges"] if e["relation"] == "grants_access_to"]
+    assert all(e["source"] == profile_id for e in grants)
+    assert all(e["confidence"] == "EXTRACTED" for e in grants)
+
+    # 3. Object permission -> grants_access_to edge, target via sobject_nid()
+    obj_grants = [e for e in grants if e["target"] == sobject_nid("Account")]
+    assert len(obj_grants) == 1
+    og = obj_grants[0]
+    assert og["sf_object"] == "Account"
+    assert og["sf_permissions"] == ["CREATE", "READ", "EDIT", "DELETE"]
+
+    # 4. FLS permissions stored as a node attribute (not a separate node)
+    fls = profile_node["sf_fls_permissions"]
+    assert fls["Account.BillingCity"] == {"readable": True, "editable": True}
+    assert fls["SBQQ__Quote__c.SBQQ__NetPrice__c"] == {
+        "readable": True,
+        "editable": False,
+    }
+
+    # 5. Apex class access detected -> grants_access_to edge to apex_<class>
+    apex_grants = [e for e in grants if e["target"] == "apex_accountservice"]
+    assert len(apex_grants) == 1
+    assert apex_grants[0]["sf_access_type"] == "apex_class"
+
+
+def test_permission_set_parser(tmp_path: Path) -> None:
+    """PermissionSet files yield a permission_set node (prefix differs)."""
+    permset = tmp_path / "Sales.permissionset-meta.xml"
+    permset.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "    <objectPermissions>\n"
+        "        <object>Account</object>\n"
+        "        <allowRead>true</allowRead>\n"
+        "    </objectPermissions>\n"
+        "</PermissionSet>\n"
+    )
+
+    result = extract_permission_set(permset)
+
+    assert "error" not in result
+    _assert_no_dangling_edges(result)
+
+    nodes = [n for n in result["nodes"] if n["file_type"] == "permission_set"]
+    assert len(nodes) == 1
+    assert nodes[0]["id"] == "permission_set_sales"
+
+    grants = [e for e in result["edges"] if e["relation"] == "grants_access_to"]
+    assert len(grants) == 1
+    assert grants[0]["target"] == sobject_nid("Account")
+    assert grants[0]["sf_permissions"] == ["READ"]
+
+
+def test_profile_parser_xml_parse_error(tmp_path: Path) -> None:
+    """Malformed Profile XML degrades gracefully to a single concept error node."""
+    bad = tmp_path / "Broken.profile-meta.xml"
+    bad.write_text("<Profile><objectPermissions></Profile>")  # mismatched tag
+
+    result = extract_profile(bad)
+
+    assert result["edges"] == []
+    assert len(result["nodes"]) == 1
+    err = result["nodes"][0]
+    assert err["file_type"] == "concept"
+    assert err["sf_error_type"] == "xml_parse_error"
 
 
 def test_lwc_parser_encoding_error(tmp_path: Path) -> None:
