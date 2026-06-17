@@ -1,0 +1,8 @@
+graphify-sf is a derivative work based on "graphify"
+(https://github.com/safishamsi/graphify), originally licensed under MIT.
+
+Original work:    Copyright (c) 2026 Safi Shamsi
+Modifications:    Copyright (c) 2026 JeremyKo95 <sukun9512@gmail.com>
+
+Salesforce-specific adaptations (LWC/Apex/CPQ/Governor Limit handling)
+are contributed by JeremyKo95.
