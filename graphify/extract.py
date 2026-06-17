@@ -11805,6 +11805,12 @@ def _get_extractor(path: Path) -> Any | None:
     # (servers, commands, packages, env vars) instead of opaque JSON keys.
     if is_mcp_config_path(path):
         return extract_mcp_config
+    if path.name.endswith(".flow-meta.xml"):
+        return _DISPATCH.get(".flow-meta.xml")
+    if path.name.endswith(".object-meta.xml"):
+        return _DISPATCH.get(".object-meta.xml")
+    if path.name.endswith(".field-meta.xml"):
+        return _DISPATCH.get(".field-meta.xml")
     return _DISPATCH.get(path.suffix)
 
 
