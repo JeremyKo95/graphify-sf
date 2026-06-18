@@ -54,6 +54,7 @@ SF_RELATIONS = {
 
     # LWC
     "wire_to",              # LWC @wire -> Apex method
+    "lwc_calls",            # LWC imperative @salesforce/apex import -> Apex method
 
     # Permission
     "grants_access_to",     # Profile/PermSet -> Object/Field

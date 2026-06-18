@@ -253,7 +253,8 @@ def test_lwc_parser() -> None:
     assert lwc_node["sf_api_property_recordId"] is True
     assert lwc_node["sf_api_property_label"] is True
 
-    # 2/3. @wire decorator -> wire_to edge to the Apex method node
+    # 2. @wire to an Apex method -> wire_to edge. @wire to getRecord (UI-API)
+    #    must NOT produce an edge.
     wire_edges = [e for e in js_result["edges"] if e["relation"] == "wire_to"]
     assert len(wire_edges) == 1
     w = wire_edges[0]
@@ -263,6 +264,15 @@ def test_lwc_parser() -> None:
     assert w["target"] == "apex_accountservice_getaccounts"
     assert w["sf_wire_method"] == "getAccounts"
     assert w["confidence"] == "INFERRED"
+
+    # 3. Imperative Apex import (saveAccount, not @wire'd) -> lwc_calls edge.
+    #    This is the real-org pattern (Opportunity LWCs call Apex imperatively)
+    #    the parser previously dropped.
+    calls = [e for e in js_result["edges"] if e["relation"] == "lwc_calls"]
+    assert len(calls) == 1
+    assert calls[0]["source"] == lwc_node["id"]
+    assert calls[0]["target"] == "apex_accountservice_saveaccount"
+    assert calls[0]["sf_apex_method"] == "saveAccount"
 
 
 def test_profile_parser() -> None:

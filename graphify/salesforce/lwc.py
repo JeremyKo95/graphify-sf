@@ -156,13 +156,7 @@ def extract_lwc_js(path: Path) -> dict:
         for m in _APEX_IMPORT_RE.finditer(js_content)
     }
 
-    # 1. @wire decorators -> wire_to edges (LWC -> Apex method) -------------
-    for wire_match in _WIRE_RE.finditer(js_content):
-        wire_ref = wire_match.group(1)
-        if wire_ref not in apex_imports:
-            # @wire to a non-Apex adapter (e.g. getRecord) — not modelled.
-            continue
-        apex_class, apex_method = apex_imports[wire_ref]
+    def _ensure_apex_stub(apex_class: str, apex_method: str) -> str:
         apex_id = _apex_method_nid(apex_class, apex_method)
         if not any(n["id"] == apex_id for n in nodes):
             nodes.append(
@@ -174,10 +168,21 @@ def extract_lwc_js(path: Path) -> dict:
                     "sf_method_type": "method",
                 }
             )
+        return apex_id
+
+    # 1. @wire decorators -> wire_to edges (LWC -> Apex method) -------------
+    wired: set[str] = set()
+    for wire_match in _WIRE_RE.finditer(js_content):
+        wire_ref = wire_match.group(1)
+        if wire_ref not in apex_imports:
+            # @wire to a non-Apex adapter (e.g. getRecord, MessageContext) — not Apex.
+            continue
+        wired.add(wire_ref)
+        apex_class, apex_method = apex_imports[wire_ref]
         edges.append(
             {
                 "source": lwc_id,
-                "target": apex_id,
+                "target": _ensure_apex_stub(apex_class, apex_method),
                 "relation": "wire_to",
                 "confidence": "INFERRED",
                 "confidence_value": 0.85,
@@ -186,7 +191,26 @@ def extract_lwc_js(path: Path) -> dict:
             }
         )
 
-    # 2. @api public properties -> node attributes -------------------------
+    # 2. Imperative Apex imports -> lwc_calls edges (LWC -> Apex method) -----
+    # An ``@salesforce/apex/Class.method`` import NOT consumed by @wire is called
+    # imperatively (e.g. ``init({...}).then(...)``). The Apex dependency is real
+    # and matters for impact analysis, so it is captured even without @wire.
+    for import_name, (apex_class, apex_method) in apex_imports.items():
+        if import_name in wired:
+            continue
+        edges.append(
+            {
+                "source": lwc_id,
+                "target": _ensure_apex_stub(apex_class, apex_method),
+                "relation": "lwc_calls",
+                "confidence": "INFERRED",
+                "confidence_value": 0.8,
+                "source_file": str(path),
+                "sf_apex_method": apex_method,
+            }
+        )
+
+    # 3. @api public properties -> node attributes -------------------------
     for prop_match in _API_PROP_RE.finditer(js_content):
         component_node[f"sf_api_property_{prop_match.group(1)}"] = True
 
