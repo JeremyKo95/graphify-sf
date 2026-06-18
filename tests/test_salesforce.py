@@ -12,6 +12,7 @@ from graphify.salesforce import extract_sf
 from graphify.salesforce.apex_enhanced import extract_apex_enhanced
 from graphify.salesforce.constants import sobject_nid
 from graphify.salesforce.cpq import cpq_analysis_pass
+from graphify.salesforce.cpq_data import extract_cpq_data
 from graphify.salesforce.flow import extract_flow
 from graphify.salesforce.flow_cpq_loops import detect_flow_cpq_loops
 from graphify.salesforce.governor_limits import (
@@ -30,6 +31,13 @@ from graphify.salesforce.objects import (
     extract_validation_rule,
 )
 from graphify.salesforce.order_of_execution import ooe_analysis_pass
+from graphify.salesforce.pipeline import build_sf_graph, write_sf_graph
+from graphify.salesforce.query import (
+    sf_cpq_chain,
+    sf_impact,
+    sf_ooe,
+    sf_violations,
+)
 from graphify.salesforce.permission_analysis import permission_analysis_pass
 from graphify.salesforce.profiles import extract_permission_set, extract_profile
 from graphify.salesforce.release_sync import check_staleness, sync_release_notes
@@ -171,7 +179,7 @@ def test_flow_parser() -> None:
     assert flow_node["sf_trigger_type"] == "CreateAndUpdate"
     flow_id = flow_node["id"]
 
-    # 3. recordLookup -> queries edge, target resolved via sobject_nid()
+    # 3. <recordLookups> -> queries edge, target resolved via sobject_nid()
     queries = [e for e in result["edges"] if e["relation"] == "queries"]
     assert len(queries) == 1
     q = queries[0]
@@ -180,14 +188,32 @@ def test_flow_parser() -> None:
     assert q["confidence"] == "EXTRACTED"
     assert q["sf_flow_element"] == "Get_Accounts"
 
-    # 4. recordCreate -> dml_operates_on edge (INSERT) to Opportunity
+    # 4. <recordCreates>/<recordUpdates> -> dml_operates_on edges.
     dml = [e for e in result["edges"] if e["relation"] == "dml_operates_on"]
-    assert len(dml) == 1
-    d = dml[0]
-    assert d["source"] == flow_id
-    assert d["target"] == sobject_nid("Opportunity")
-    assert d["sf_dml_type"] == "INSERT"
-    assert d["sf_flow_element"] == "Create_Opportunity"
+    by_elem = {e["sf_flow_element"]: e for e in dml}
+
+    # 4a. Direct <object> create -> INSERT Opportunity.
+    create_opp = by_elem["Create_Opportunity"]
+    assert create_opp["target"] == sobject_nid("Opportunity")
+    assert create_opp["sf_dml_type"] == "INSERT"
+
+    # 4b. <inputReference> create -> object resolved via the variable's
+    #     objectType (NewQuote -> SBQQ__Quote__c). This is the real-org pattern
+    #     the previous parser missed entirely.
+    create_quote = by_elem["Create_Quote"]
+    assert create_quote["target"] == sobject_nid("SBQQ__Quote__c")
+    assert create_quote["sf_dml_type"] == "INSERT"
+
+    # 4c. <recordUpdates> -> UPDATE Account.
+    update_acc = by_elem["Update_Account"]
+    assert update_acc["target"] == sobject_nid("Account")
+    assert update_acc["sf_dml_type"] == "UPDATE"
+
+    # 5. <actionCalls actionType=apex> -> flow_invokes (INFERRED).
+    invokes = [e for e in result["edges"] if e["relation"] == "flow_invokes"]
+    assert len(invokes) == 1
+    assert invokes[0]["target"] == "apex_accountservice"
+    assert invokes[0]["confidence"] == "INFERRED"
 
     # 5. apexAction -> flow_invokes edge to the Apex class
     invokes = [e for e in result["edges"] if e["relation"] == "flow_invokes"]
@@ -1116,6 +1142,231 @@ def test_validation_cpq_fires_end_to_end(tmp_path: Path) -> None:
 
     # The Validation Rule parser also feeds the OoE pass with a ``validates`` edge.
     assert any(e["relation"] == "validates" for e in result["edges"])
+
+
+def test_pipeline_build_sf_graph_enriches(tmp_path: Path) -> None:
+    """build_sf_graph -> directed graph with community labels; round-trips to JSON."""
+    extraction = extract_sf(SAMPLE_ORG)
+    G = build_sf_graph(extraction)
+
+    assert isinstance(G, nx.DiGraph)
+    # Every node lands in a community (serve._communities_from_graph reads this).
+    assert G.number_of_nodes() > 0
+    assert all("community" in d for _, d in G.nodes(data=True))
+
+    out = write_sf_graph(G, tmp_path / "graph.json")
+    assert out.exists()
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["directed"] is True
+    assert "links" in data  # serve._load_graph reads this key
+
+
+def _sf_query_graph() -> nx.DiGraph:
+    """Small enriched SF graph for query-core tests."""
+    quote = sobject_nid("SBQQ__Quote__c")
+    G = nx.DiGraph()
+    G.add_node("apex_accounttrigger", label="AccountTrigger", file_type="code")
+    G.add_node("sobject_opportunity", label="Opportunity", file_type="sobject")
+    G.add_node("gov_limit_soql_in_loop", label="⚠ SOQL-in-loop", file_type="concept")
+    G.add_node("apex_weak", label="WeakLink", file_type="code")
+    G.add_node(quote, label="SBQQ__Quote__c", file_type="sobject")
+    G.add_node("cpq_rule_disc", label="SBQQ__PriceRule__c Discount", file_type="cpq_rule")
+    G.add_node("ooe_quote_1", label="OoE Quote step1", file_type="concept")
+    G.add_node("ooe_quote_2", label="OoE Quote step2", file_type="concept")
+
+    G.add_edge("apex_accounttrigger", "sobject_opportunity",
+               relation="queries", confidence="EXTRACTED", confidence_value=1.0)
+    G.add_edge("apex_accounttrigger", "gov_limit_soql_in_loop",
+               relation="governor_violation", confidence="EXTRACTED",
+               sf_violation_type="soql_in_loop", sf_severity="HIGH")
+    G.add_edge("apex_accounttrigger", "apex_weak",
+               relation="calls", confidence="AMBIGUOUS", confidence_value=0.4)
+    G.add_edge("cpq_rule_disc", quote,
+               relation="cpq_applies_to", confidence="INFERRED", execution_order=2)
+    G.add_edge("ooe_quote_1", "ooe_quote_2",
+               relation="order_of_execution", confidence="EXTRACTED")
+    return G
+
+
+def test_sf_impact_traversal_and_confidence_filter() -> None:
+    G = _sf_query_graph()
+
+    imp = sf_impact(G, "AccountTrigger", depth=2)
+    assert imp["node"] == "apex_accounttrigger"
+    assert {"sobject_opportunity", "gov_limit_soql_in_loop", "apex_weak"} <= set(imp["nodes"])
+    assert "IMPACT" in imp["text"]
+
+    # min_confidence drops the AMBIGUOUS (0.4) calls edge to WeakLink.
+    filtered = sf_impact(G, "AccountTrigger", depth=2, min_confidence=0.8)
+    assert "apex_weak" not in filtered["nodes"]
+    assert "sobject_opportunity" in filtered["nodes"]
+
+    # Unresolvable node -> node None, explanatory text, no crash.
+    assert sf_impact(G, "NoSuchSymbol")["node"] is None
+
+
+def test_sf_violations_and_severity_filter() -> None:
+    G = _sf_query_graph()
+    allv = sf_violations(G)
+    assert any(v["violation_type"] == "soql_in_loop" for v in allv["violations"])
+
+    high = sf_violations(G, severity="HIGH")
+    assert len(high["violations"]) == 1
+    assert high["violations"][0]["severity"] == "HIGH"
+
+    assert sf_violations(G, severity="CRITICAL")["violations"] == []
+
+
+def test_sf_cpq_chain_and_ooe() -> None:
+    G = _sf_query_graph()
+    chain = sf_cpq_chain(G, "SBQQ__Quote__c")
+    assert chain["target"] == sobject_nid("SBQQ__Quote__c")
+    assert any(s.get("execution_order") == 2 for s in chain["steps"])
+
+    ooe = sf_ooe(G, "Quote")
+    assert ("ooe_quote_1", "ooe_quote_2") in ooe["edges"]
+
+
+def test_cpq_data_parser() -> None:
+    """SFDX JSON SBQQ exports -> cpq_rule/condition/action nodes + edges."""
+    result = extract_cpq_data(FIXTURES / "sf_cpq_data")
+    nodes = {n["id"]: n for n in result["nodes"]}
+
+    # Price Rule node: applies object + aggregated target fields + eval order.
+    rule = nodes["cpq_rule_a0x0000000000001"]
+    assert rule["file_type"] == "cpq_rule"
+    assert rule["sf_cpq_object"] == "SBQQ__Quote__c"
+    assert rule["sf_cpq_rule_type"] == "Price"
+    assert rule["sf_target_fields"] == ["SBQQ__Discount__c"]
+    assert rule["sf_eval_order"] == 15
+
+    # Condition + action nodes carry their fields.
+    assert nodes["cpq_condition_a0y0000000000001"]["sf_field"] == "SBQQ__Quantity__c"
+    assert nodes["cpq_action_a0z0000000000001"]["sf_target_field"] == "SBQQ__Discount__c"
+
+    rels = {(e["source"], e["relation"], e["target"]) for e in result["edges"]}
+    assert ("cpq_rule_a0x0000000000001", "cpq_has_condition",
+            "cpq_condition_a0y0000000000001") in rels
+    assert ("cpq_rule_a0x0000000000001", "cpq_has_action",
+            "cpq_action_a0z0000000000001") in rels
+    assert any(s == "cpq_rule_a0x0000000000001" and r == "cpq_applies_to"
+               for s, r, _ in rels)
+
+    # No dangling edges.
+    ids = set(nodes)
+    for e in result["edges"]:
+        assert e["source"] in ids and e["target"] in ids
+
+
+def test_cpq_data_gearset_format(tmp_path: Path) -> None:
+    """Gearset *.gs.json (Object/Fields/References) ingests natively — no adapter."""
+    rule_dir = tmp_path / "SBQQ__PriceRule__c"
+    act_dir = tmp_path / "SBQQ__PriceAction__c"
+    rule_dir.mkdir(); act_dir.mkdir()
+    (rule_dir / "r.gs.json").write_text(json.dumps({
+        "Object": "SBQQ__PriceRule__c",
+        "Fields": {"GearsetExternalId__c": "RULE1", "Name": "Apply Discount",
+                   "SBQQ__EvaluationOrder__c": "50.0", "SBQQ__LookupObject__c": "SBQQ__Quote__c"},
+    }), encoding="utf-8")
+    (act_dir / "a.gs.json").write_text(json.dumps({
+        "Object": "SBQQ__PriceAction__c",
+        "Fields": {"GearsetExternalId__c": "ACT1", "SBQQ__Field__c": "SBQQ__Discount__c"},
+        "References": [{"Name": "SBQQ__Rule__r", "ReferencedObject": "SBQQ__PriceRule__c",
+                        "ReferencedFields": {"GearsetExternalId__c": "RULE1"}}],
+    }), encoding="utf-8")
+
+    result = extract_cpq_data(tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+
+    rule = nodes["cpq_rule_rule1"]
+    assert rule["sf_eval_order"] == 50.0           # "50.0" string coerced
+    assert rule["sf_target_fields"] == ["SBQQ__Discount__c"]  # via References parent link
+    assert rule["sf_cpq_object"] == "SBQQ__Quote__c"
+    rels = {(e["source"], e["relation"], e["target"]) for e in result["edges"]}
+    assert ("cpq_rule_rule1", "cpq_has_action", "cpq_action_act1") in rels
+    ids = set(nodes)
+    for e in result["edges"]:
+        assert e["source"] in ids and e["target"] in ids
+
+
+def test_cpq_data_qcp_custom_script_js(tmp_path: Path) -> None:
+    """SBQQ__CustomScript__c (JS QCP) -> qcp_method nodes + declared field signals."""
+    sdir = tmp_path / "SBQQ__CustomScript__c"
+    sdir.mkdir()
+    (sdir / "qcp.gs.json").write_text(json.dumps({
+        "Object": "SBQQ__CustomScript__c",
+        "Fields": {
+            "GearsetExternalId__c": "QCP1", "Name": "Custom_QCP_Script",
+            "SBQQ__Code__c": "export function onBeforeCalculate(q){} "
+                             "export function onAfterCalculate(q){ q.SBQQ__Discount__c=1; }",
+            "SBQQ__QuoteFields__c": ["SBQQ__Discount__c", "RequestedAmount__c"],
+            "SBQQ__QuoteLineFields__c": ["RequestedPrice__c"],
+        },
+    }), encoding="utf-8")
+
+    result = extract_cpq_data(tmp_path)
+    nodes = {n["id"]: n for n in result["nodes"]}
+
+    # The script itself is a QCP implementation carrying its declared fields.
+    script = nodes["cpq_script_qcp1"]
+    assert script["sf_qcp_implementation"] is True
+    assert script["sf_qcp_language"] == "javascript"
+    assert script["sf_cpq_object"] == "SBQQ__Quote__c"
+    assert set(script["sf_target_fields"]) == {
+        "SBQQ__Discount__c", "RequestedAmount__c", "RequestedPrice__c"}
+
+    # One cpq_qcp_method node per detected JS hook (so sf_cpq_chain lists them).
+    qcp_methods = {n["sf_qcp_method"] for n in result["nodes"]
+                   if n.get("file_type") == "cpq_qcp_method"}
+    assert qcp_methods == {"onBeforeCalculate", "onAfterCalculate"}
+
+
+def test_extract_sf_cpq_data_fires_validation_and_order(tmp_path: Path) -> None:
+    """CPQ data + a Validation Rule on the same field -> cpq_validation_risk; real order."""
+    default = tmp_path / "force-app" / "main" / "default"
+    vr_dir = default / "objects" / "SBQQ__Quote__c" / "validationRules"
+    vr_dir.mkdir(parents=True)
+    (vr_dir / "MaxDiscount.validationRule-meta.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <fullName>MaxDiscount</fullName>\n"
+        "  <errorConditionFormula>SBQQ__Discount__c &gt; 50</errorConditionFormula>\n"
+        "</ValidationRule>\n",
+        encoding="utf-8",
+    )
+
+    result = extract_sf(tmp_path, cpq_data_dir=str(FIXTURES / "sf_cpq_data"))
+    _assert_no_dangling_edges(result)
+
+    # The real Price Rule (writes Discount) vs the Validation Rule (checks Discount).
+    risks = [e for e in result["edges"] if e["relation"] == "cpq_validation_risk"]
+    assert risks, "expected cpq_validation_risk from real CPQ rule fields"
+    assert risks[0]["sf_overlapping_fields"] == ["sbqq__discount__c"]
+
+    # execution_order reflects the real SBQQ__EvaluationOrder__c (15), not a guess.
+    applies = [e for e in result["edges"]
+               if e["relation"] == "cpq_applies_to"
+               and e["source"] == "cpq_rule_a0x0000000000001"]
+    assert applies and applies[0]["execution_order"] == 15
+
+
+def test_viz_build_self_contained_html(tmp_path: Path) -> None:
+    """sf viz builds a focused, self-contained HTML with embedded data (no fetch)."""
+    from graphify.salesforce.viz import build_viz, focus_subgraph
+
+    G = _sf_query_graph()  # reuse the small enriched graph
+    # focus_subgraph centers on seeds + 1-hop, excludes test nodes.
+    seeds = ["apex_accounttrigger"]
+    node_ids, edges = focus_subgraph(G, seeds, max_nodes=20)
+    assert "apex_accounttrigger" in node_ids
+    assert "sobject_opportunity" in node_ids  # 1-hop neighbor
+
+    out = build_viz(G, tmp_path / "v.html", focus=["AccountTrigger"], title="T")
+    assert out.exists()
+    html = out.read_text(encoding="utf-8")
+    assert "<!DOCTYPE html>" in html
+    assert "fetch(" not in html  # data embedded inline, not fetched (no CORS)
+    assert "apex_accounttrigger" in html  # graph data is embedded
 
 
 def test_objects_parser_xml_parse_error(tmp_path: Path) -> None:

@@ -148,12 +148,13 @@ def _merge_lwc_components(all_nodes, all_edges):
         node_by_id.pop(html_id, None)
 
 
-def extract_sf(path, **kwargs):
+def extract_sf(path, *, cpq_data_dir=None, **kwargs):
     """Extract a Salesforce repository into a knowledge graph.
 
     Dispatches every supported Salesforce file under ``path`` to its parser,
     merges the results (deduping nodes by ID for cross-file resolution), then
-    runs the SF analysis passes in the fixed ADR-011 order:
+    merges any CPQ configuration data (``cpq_data_dir``) before running the SF
+    analysis passes in the fixed ADR-011 order:
 
         1. ``cpq_analysis_pass``       — reclassify SBQQ__ nodes, detect QCP.
         2. ``_merge_lwc_components``   — fold LWC HTML + JS into one node.
@@ -176,8 +177,11 @@ def extract_sf(path, **kwargs):
     Args:
         path: Path to a Salesforce repository / metadata directory (or a single
             metadata file).
-        **kwargs: Reserved for future options (output-dir, neo4j-uri, …);
-            currently ignored by the in-memory extraction wrapper.
+        cpq_data_dir: Optional directory of SFDX JSON exports of SBQQ CPQ records
+            (Price/Product Rules, Conditions, Actions). When given, the real CPQ
+            rule logic is merged in before the analysis passes so ``validation_cpq``
+            / impact see the fields rules actually read/write (Phase 2).
+        **kwargs: Reserved for future options (neo4j-uri, …); currently ignored.
 
     Returns:
         ``{"nodes": [...], "edges": [...]}`` — the merged, analyzed graph.
@@ -214,6 +218,17 @@ def extract_sf(path, **kwargs):
         for node in result.get("nodes", []):
             _merge_into(all_nodes, node_by_id, node)
         all_edges.extend(result.get("edges", []))
+
+    # CPQ configuration data (SFDX JSON exports) — the rule LOGIC that lives as
+    # SBQQ data records, not metadata files. Merged before the analysis passes so
+    # validation_cpq / impact see the real fields the rules read/write (Phase 2).
+    if cpq_data_dir is not None:
+        from .cpq_data import extract_cpq_data
+
+        cpq_result = extract_cpq_data(cpq_data_dir)
+        for node in cpq_result.get("nodes", []):
+            _merge_into(all_nodes, node_by_id, node)
+        all_edges.extend(cpq_result.get("edges", []))
 
     # Analysis passes — fixed order (ADR-011). Passes 1-3 mutate in place;
     # passes 4-7 are pure functions whose diagnostic edges are appended here.

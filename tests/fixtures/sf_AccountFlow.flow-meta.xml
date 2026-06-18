@@ -5,26 +5,43 @@
         <name>Decision1</name>
         <label>Check Amount</label>
     </decisions>
-    <elements>
+    <recordLookups>
         <name>Get_Accounts</name>
-        <type>recordLookup</type>
-        <targetObject>Account</targetObject>
-    </elements>
-    <elements>
-        <name>Call_Apex</name>
-        <type>apexAction</type>
-        <apexClass>AccountService</apexClass>
-    </elements>
-    <elements>
+        <label>Get Accounts</label>
+        <object>Account</object>
+        <getFirstRecordOnly>true</getFirstRecordOnly>
+    </recordLookups>
+    <recordCreates>
         <name>Create_Opportunity</name>
-        <type>recordCreate</type>
+        <label>Create Opportunity</label>
         <object>Opportunity</object>
-    </elements>
+    </recordCreates>
+    <recordCreates>
+        <name>Create_Quote</name>
+        <label>Create Quote</label>
+        <inputReference>NewQuote</inputReference>
+    </recordCreates>
+    <recordUpdates>
+        <name>Update_Account</name>
+        <label>Update Account</label>
+        <object>Account</object>
+    </recordUpdates>
+    <actionCalls>
+        <name>Call_Apex</name>
+        <actionName>AccountService</actionName>
+        <actionType>apex</actionType>
+    </actionCalls>
+    <variables>
+        <name>NewQuote</name>
+        <dataType>SObject</dataType>
+        <objectType>SBQQ__Quote__c</objectType>
+    </variables>
     <start>
         <connector>
             <targetReference>Decision1</targetReference>
         </connector>
         <object>Account</object>
         <recordTriggerType>CreateAndUpdate</recordTriggerType>
+        <triggerType>RecordAfterSave</triggerType>
     </start>
 </Flow>

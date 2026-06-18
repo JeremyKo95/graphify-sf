@@ -563,7 +563,7 @@ def _build_server(graph_path: str):
 
     @server.list_tools()
     async def list_tools() -> list[types.Tool]:
-        return [
+        tools = [
             types.Tool(
                 name="query_graph",
                 description="Search the knowledge graph using BFS or DFS. Returns relevant nodes and edges as text context.",
@@ -684,6 +684,55 @@ def _build_server(graph_path: str):
                 },
             ),
         ]
+        # Surface Salesforce-semantic tools only when the loaded graph is an SF
+        # graph (keeps non-SF graphs' tool list unchanged).
+        _sf_types = {"sobject", "cpq_rule", "cpq_qcp_method", "validation_rule",
+                     "flow", "lwc_component", "profile", "permission_set"}
+        if any(d.get("file_type") in _sf_types for _, d in G.nodes(data=True)):
+            tools.extend([
+                types.Tool(
+                    name="sf_impact",
+                    description="Salesforce impact analysis: what breaks if you change a node (directional, confidence-ranked, token-bounded).",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "node": {"type": "string", "description": "Apex class / SObject / Flow label or ID"},
+                            "direction": {"type": "string", "enum": ["downstream", "upstream", "both"], "default": "downstream"},
+                            "depth": {"type": "integer", "default": 3},
+                            "min_confidence": {"type": "number", "default": 0.0},
+                            "token_budget": {"type": "integer", "default": 2000},
+                        },
+                        "required": ["node"],
+                    },
+                ),
+                types.Tool(
+                    name="sf_violations",
+                    description="List Salesforce risk edges (governor limit / infinite-loop / CPQ-validation / FLS) ordered by severity.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {"severity": {"type": "string", "description": "CRITICAL|HIGH|MEDIUM|LOW|INFO"}},
+                    },
+                ),
+                types.Tool(
+                    name="sf_cpq_chain",
+                    description="CPQ Calc Engine execution order (Price/Product Rules + QCP callbacks) for a Quote object.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {"object": {"type": "string", "description": "Quote object API name or ID"}},
+                        "required": ["object"],
+                    },
+                ),
+                types.Tool(
+                    name="sf_ooe",
+                    description="Order-of-Execution chain for an SObject.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {"object": {"type": "string", "description": "SObject API name or ID"}},
+                        "required": ["object"],
+                    },
+                ),
+            ])
+        return tools
 
     def _tool_query_graph(arguments: dict) -> str:
         import time as _time
@@ -933,6 +982,28 @@ def _build_server(graph_path: str):
             )
         return "\n\n".join(lines)
 
+    def _tool_sf_impact(arguments: dict) -> str:
+        from graphify.salesforce.query import sf_impact
+        return sf_impact(
+            G, arguments["node"],
+            direction=arguments.get("direction", "downstream"),
+            depth=min(int(arguments.get("depth", 3)), 6),
+            min_confidence=float(arguments.get("min_confidence", 0.0)),
+            token_budget=int(arguments.get("token_budget", 2000)),
+        )["text"]
+
+    def _tool_sf_violations(arguments: dict) -> str:
+        from graphify.salesforce.query import sf_violations
+        return sf_violations(G, severity=arguments.get("severity"))["text"]
+
+    def _tool_sf_cpq_chain(arguments: dict) -> str:
+        from graphify.salesforce.query import sf_cpq_chain
+        return sf_cpq_chain(G, arguments["object"])["text"]
+
+    def _tool_sf_ooe(arguments: dict) -> str:
+        from graphify.salesforce.query import sf_ooe
+        return sf_ooe(G, arguments["object"])["text"]
+
     _handlers = {
         "query_graph": _tool_query_graph,
         "get_node": _tool_get_node,
@@ -944,6 +1015,10 @@ def _build_server(graph_path: str):
         "list_prs": _tool_list_prs,
         "get_pr_impact": _tool_get_pr_impact,
         "triage_prs": _tool_triage_prs,
+        "sf_impact": _tool_sf_impact,
+        "sf_violations": _tool_sf_violations,
+        "sf_cpq_chain": _tool_sf_cpq_chain,
+        "sf_ooe": _tool_sf_ooe,
     }
 
     def _load_community_labels() -> dict[int, str]:

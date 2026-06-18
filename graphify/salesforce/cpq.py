@@ -143,19 +143,26 @@ def cpq_analysis_pass(all_nodes: list[dict], all_edges: list[dict]) -> None:
                 )
 
     # 3. Annotate cpq_applies_to edges with Calc Engine execution order --------
-    # Build a label lookup for cpq_rule nodes (post-reclassification).
-    cpq_rule_labels = {
-        n["id"]: n.get("label", "")
-        for n in all_nodes
-        if n.get("file_type") == "cpq_rule"
+    # Precedence (Step 2.3): a real ``SBQQ__EvaluationOrder__c`` from CPQ data
+    # (``sf_eval_order`` on the rule) wins; then the rule's declared
+    # ``sf_cpq_rule_type``; then a label-substring heuristic for metadata-only
+    # rules; finally a default.
+    cpq_rules = {
+        n["id"]: n for n in all_nodes if n.get("file_type") == "cpq_rule"
     }
     for edge in all_edges:
         if edge.get("relation") != "cpq_applies_to":
             continue
-        label = cpq_rule_labels.get(edge.get("source", ""))
-        if label is not None and "Product" in label:
+        rule = cpq_rules.get(edge.get("source", ""))
+        eval_order = rule.get("sf_eval_order") if rule else None
+        if isinstance(eval_order, (int, float)):
+            edge["execution_order"] = int(eval_order)
+            continue
+        rule_type = rule.get("sf_cpq_rule_type") if rule else None
+        label = rule.get("label", "") if rule else ""
+        if rule_type == "Product" or "Product" in label:
             edge["execution_order"] = CPQ_CALC_ENGINE_ORDER["Product Rules"]
-        elif label is not None and "Price" in label:
+        elif rule_type == "Price" or "Price" in label:
             edge["execution_order"] = CPQ_CALC_ENGINE_ORDER["Price Rules"]
         else:
             edge["execution_order"] = _DEFAULT_EXECUTION_ORDER

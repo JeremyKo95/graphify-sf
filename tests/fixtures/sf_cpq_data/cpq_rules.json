@@ -1,0 +1,42 @@
+{
+  "status": 0,
+  "result": {
+    "totalSize": 4,
+    "done": true,
+    "records": [
+      {
+        "attributes": { "type": "SBQQ__PriceRule__c" },
+        "Id": "a0x0000000000001",
+        "Name": "Volume Discount",
+        "SBQQ__EvaluationOrder__c": 15,
+        "SBQQ__Active__c": true,
+        "SBQQ__LookupObject__c": "SBQQ__Quote__c"
+      },
+      {
+        "attributes": { "type": "SBQQ__PriceCondition__c" },
+        "Id": "a0y0000000000001",
+        "Name": "Qty over 10",
+        "SBQQ__Rule__c": "a0x0000000000001",
+        "SBQQ__Field__c": "SBQQ__Quantity__c",
+        "SBQQ__Operator__c": "greater than",
+        "SBQQ__Object__c": "SBQQ__QuoteLine__c"
+      },
+      {
+        "attributes": { "type": "SBQQ__PriceAction__c" },
+        "Id": "a0z0000000000001",
+        "Name": "Set Discount",
+        "SBQQ__Rule__c": "a0x0000000000001",
+        "SBQQ__TargetField__c": "SBQQ__Discount__c",
+        "SBQQ__TargetObject__c": "SBQQ__Quote__c",
+        "SBQQ__Formula__c": "10"
+      },
+      {
+        "attributes": { "type": "SBQQ__ProductRule__c" },
+        "Id": "a0w0000000000001",
+        "Name": "Bundle Validation",
+        "SBQQ__Type__c": "Validation",
+        "SBQQ__EvaluationEvent__c": "SBQQ__Quote__c"
+      }
+    ]
+  }
+}

@@ -32,6 +32,8 @@ SF_FILE_TYPES = {
     "permission_set",   # Permission Set
     "cpq_rule",         # CPQ Price/Product Rule object
     "cpq_qcp_method",   # QCP Calc Engine callback node (ADR-025)
+    "cpq_condition",    # CPQ Price/Error Condition record (cpq_data)
+    "cpq_action",       # CPQ Price/Product Action record (cpq_data)
     "aura_component",   # Aura Component (legacy)
     "validation_rule",  # Validation Rule (ADR-030)
 }
@@ -59,6 +61,10 @@ SF_RELATIONS = {
 
     # CPQ
     "cpq_applies_to",       # CPQ Rule/QCP -> target object
+    "cpq_has_condition",    # CPQ Rule -> Price/Error Condition (cpq_data)
+    "cpq_has_action",       # CPQ Rule -> Price/Product Action (cpq_data)
+    "cpq_reads_field",      # CPQ Condition -> Field (cpq_data)
+    "cpq_writes_field",     # CPQ Action -> Field (cpq_data)
 
     # Order of Execution
     "order_of_execution",   # OoE Step N -> Step N+1 (DAG)
