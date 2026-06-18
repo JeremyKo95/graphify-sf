@@ -21,6 +21,7 @@ lenient mode).
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -31,6 +32,55 @@ _NS = {"md": "http://soap.sforce.com/2006/04/metadata"}
 
 #: Field types that reference another SObject.
 _RELATIONSHIP_TYPES = {"Lookup", "MasterDetail"}
+
+#: Identifier (and dotted reference) token in a Salesforce formula, e.g.
+#: ``SBQQ__Discount__c`` or ``Account.Owner.Name``.
+_FORMULA_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+
+#: Formula functions / literals that are NOT field references. A token directly
+#: followed by ``(`` is already treated as a function call; this set additionally
+#: filters bare literals and a few common operators that take no parens.
+_FORMULA_FUNCTIONS = {
+    "AND", "OR", "NOT", "IF", "CASE", "ISCHANGED", "ISNEW", "ISBLANK",
+    "ISNULL", "ISNUMBER", "ISPICKVAL", "PRIORVALUE", "TEXT", "VALUE", "LEN",
+    "BEGINS", "CONTAINS", "INCLUDES", "REGEX", "TODAY", "NOW", "DATE",
+    "DATEVALUE", "ABS", "ROUND", "MAX", "MIN", "MOD", "FLOOR", "CEILING",
+    "BLANKVALUE", "NULLVALUE", "VLOOKUP", "TRUE", "FALSE", "NULL",
+}
+
+
+def _extract_formula_fields(formula: str | None) -> list[str]:
+    """Extract field references from a Validation Rule formula.
+
+    Returns the distinct field tokens (order-preserving) a formula reads, with
+    function calls and literals removed. Dotted cross-object references
+    (``Account.Name``) are kept whole; the consumer normalizes to the bare field
+    token. Best-effort static parse (ADR-030): conditional / dynamic logic is not
+    resolved, so the result is a superset of fields the rule may actually use.
+    """
+    if not formula:
+        return []
+    fields: list[str] = []
+    seen: set[str] = set()
+    for match in _FORMULA_TOKEN_RE.finditer(formula):
+        token = match.group(0)
+        # A token immediately followed by "(" is a function call, not a field.
+        after = formula[match.end():].lstrip()
+        if after.startswith("("):
+            continue
+        if token.upper() in _FORMULA_FUNCTIONS:
+            continue
+        if token not in seen:
+            seen.add(token)
+            fields.append(token)
+    return fields
+
+
+def _validation_rule_nid(object_api: str, rule_name: str) -> str:
+    """Build a stable node ID for a Validation Rule (``validation_<obj>_<rule>``)."""
+    obj = object_api.lower().replace("__c", "").replace("__", "_")
+    rule = rule_name.lower()
+    return f"validation_{obj}_{rule}"
 
 
 def _field_nid(api_name: str) -> str:
@@ -141,7 +191,60 @@ def extract_custom_object(path: Path) -> dict:
                     }
                 )
 
+    # 4. Embedded Validation Rules (<validationRules> children) ------------
+    for vr_elem in root.findall("md:validationRules", namespaces=_NS):
+        rule_name = vr_elem.findtext("md:fullName", namespaces=_NS)
+        if not rule_name:
+            continue
+        formula = vr_elem.findtext("md:errorConditionFormula", namespaces=_NS)
+        active = vr_elem.findtext("md:active", namespaces=_NS) != "false"
+        _add_validation_rule(
+            nodes, edges, label, sobject_id, rule_name, formula, active, path
+        )
+
     return {"nodes": nodes, "edges": edges}
+
+
+def _add_validation_rule(
+    nodes: list[dict],
+    edges: list[dict],
+    object_api: str,
+    sobject_id: str,
+    rule_name: str,
+    formula: str | None,
+    active: bool,
+    path: Path,
+) -> None:
+    """Append a ``validation_rule`` node + a ``validates`` edge to its SObject.
+
+    The node carries ``sf_referenced_fields`` (parsed from the error-condition
+    formula) and ``sf_object`` so the CPQ ↔ Validation overlap pass
+    (validation_cpq, ADR-030) and the Order-of-Execution pass (which consumes
+    ``validates`` edges) both have what they need. ``_ensure_sobject_node`` keeps
+    the ``validates`` edge from dangling.
+    """
+    rule_id = _validation_rule_nid(object_api, rule_name)
+    nodes.append(
+        {
+            "id": rule_id,
+            "label": rule_name,
+            "file_type": "validation_rule",
+            "source_file": str(path),
+            "sf_object": object_api,
+            "sf_active": active,
+            "sf_referenced_fields": _extract_formula_fields(formula),
+        }
+    )
+    _ensure_sobject_node(nodes, sobject_id, object_api, path)
+    edges.append(
+        {
+            "source": rule_id,
+            "target": sobject_id,
+            "relation": "validates",
+            "confidence": "EXTRACTED",
+            "source_file": str(path),
+        }
+    )
 
 
 def _ensure_sobject_node(
@@ -250,4 +353,70 @@ def extract_custom_field(path: Path) -> dict:
                     }
                 )
 
+    return {"nodes": nodes, "edges": edges}
+
+
+def _parent_object_from_validation_path(path: Path) -> str | None:
+    """Infer the owning object's API name from a validationRule-meta.xml path.
+
+    Salesforce layout:
+    ``objects/<Object>/validationRules/<Rule>.validationRule-meta.xml``.
+    Returns the ``<Object>`` directory name, or ``None`` if the layout differs.
+    """
+    parts = path.parts
+    if "validationRules" in parts:
+        idx = parts.index("validationRules")
+        if idx >= 1:
+            return parts[idx - 1]
+    return None
+
+
+def extract_validation_rule(path: Path) -> dict:
+    """Parse a standalone ``*.validationRule-meta.xml`` (ValidationRule) file.
+
+    The owning object is inferred from the directory layout
+    (``objects/<Object>/validationRules/<Rule>.validationRule-meta.xml``). The
+    rule name comes from ``<fullName>`` (falling back to the file stem). Produces
+    a ``validation_rule`` node (with ``sf_referenced_fields`` from the formula)
+    and a ``validates`` edge to its SObject. On XML parse failure a single
+    ``concept`` error node is returned (graceful degradation, ADR-009).
+    """
+    path = Path(path)
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as exc:
+        return _parse_error_node(path, exc)
+
+    rule_name = (
+        root.findtext("md:fullName", namespaces=_NS)
+        or path.name.split(".")[0]
+    )
+    formula = root.findtext("md:errorConditionFormula", namespaces=_NS)
+    active = root.findtext("md:active", namespaces=_NS) != "false"
+
+    object_api = _parent_object_from_validation_path(path)
+    if object_api is None:
+        # Layout doesn't reveal the object: emit the rule node alone (no edge)
+        # so the formula's fields are still recorded, never a dangling edge.
+        rule_id = _validation_rule_nid(path.stem, rule_name)
+        return {
+            "nodes": [
+                {
+                    "id": rule_id,
+                    "label": rule_name,
+                    "file_type": "validation_rule",
+                    "source_file": str(path),
+                    "sf_active": active,
+                    "sf_referenced_fields": _extract_formula_fields(formula),
+                }
+            ],
+            "edges": [],
+        }
+
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    _add_validation_rule(
+        nodes, edges, object_api, sobject_nid(object_api),
+        rule_name, formula, active, path,
+    )
     return {"nodes": nodes, "edges": edges}

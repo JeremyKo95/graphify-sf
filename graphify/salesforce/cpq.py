@@ -27,11 +27,41 @@ lists.
 
 from __future__ import annotations
 
+import re
+
 from graphify.salesforce.constants import (
     CPQ_QCP_INTERFACE,
     CPQ_QCP_METHODS,
     CPQ_RULE_PREFIX,
 )
+
+#: Field WRITES inside QCP plugin Apex. Two idioms the Calc Engine plugins use:
+#:   1. ``line.put('SBQQ__Discount__c', v)`` / ``.put("Discount__c", v)``
+#:   2. ``quoteLine.SBQQ__Discount__c = v`` (direct custom-field assignment;
+#:      ``=`` not ``==``, custom ``__c`` / ``__r`` fields only to stay precise).
+_QCP_PUT_RE = re.compile(r"\.put\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]")
+_QCP_ASSIGN_RE = re.compile(r"\.([A-Za-z_][A-Za-z0-9_]*__[rc])\s*=(?!=)")
+
+#: QCP plugins operate on the Quote / QuoteLine; the object recorded for
+#: CPQ↔Validation overlap matching (validation_cpq, ADR-030).
+_QCP_CPQ_OBJECT = "SBQQ__Quote__c"
+
+
+def _extract_qcp_field_writes(source: str) -> list[str]:
+    """Extract the fields a QCP plugin writes from its Apex source.
+
+    Best-effort static parse (ADR-019 regex-first): returns the distinct field
+    API names assigned via ``.put('Field')`` or ``obj.Field__c =``. Dynamic
+    field names (``.put(varName)``) are unresolved and intentionally skipped.
+    """
+    fields: list[str] = []
+    seen: set[str] = set()
+    for match in (*_QCP_PUT_RE.finditer(source), *_QCP_ASSIGN_RE.finditer(source)):
+        field = match.group(1)
+        if field not in seen:
+            seen.add(field)
+            fields.append(field)
+    return fields
 
 #: CPQ Calc Engine execution order (ADR-025, PRD "CPQ Calc Engine 호출 순서").
 #: Maps a rule-class / QCP-callback name fragment to its order in the chain.
@@ -90,6 +120,13 @@ def cpq_analysis_pass(all_nodes: list[dict], all_edges: list[dict]) -> None:
         ):
             class_id = node["id"]
             node["sf_qcp_implementation"] = True
+
+            # Record the fields the plugin writes so the CPQ ↔ Validation overlap
+            # pass (validation_cpq, ADR-030) can treat the QCP as a CPQ writer.
+            field_writes = _extract_qcp_field_writes(source)
+            if field_writes:
+                node["sf_target_fields"] = field_writes
+                node.setdefault("sf_cpq_object", _QCP_CPQ_OBJECT)
 
             for method_name in CPQ_QCP_METHODS:
                 if method_name not in source:

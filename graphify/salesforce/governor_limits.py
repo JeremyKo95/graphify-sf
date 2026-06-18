@@ -29,7 +29,30 @@ never duplicates them), so that the returned edges are never dangling.
 
 from __future__ import annotations
 
+import re
+
+import networkx as nx
+
 from graphify.salesforce.constants import GOVERNOR_LIMITS
+
+#: Recursion-prevention markers (ADR-027 "safe recursion"). A node in a call
+#: cycle whose string attributes match any of these is treated as an intentional,
+#: guarded recursion: the cycle is still reported but tagged
+#: ``sf_safe_recursion=True`` and downgraded from HIGH to LOW severity.
+_SAFE_RECURSION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"static\s+Boolean", re.IGNORECASE),   # static boolean flag
+    re.compile(r"\bisRunning\b", re.IGNORECASE),
+    re.compile(r"\bisExecuting\b", re.IGNORECASE),
+    re.compile(r"\bisFirstRun\b", re.IGNORECASE),
+    re.compile(r"TriggerHandler", re.IGNORECASE),
+    re.compile(r"TriggerContext", re.IGNORECASE),
+    re.compile(r"isBypassed|bypass", re.IGNORECASE),
+]
+
+#: Cycles longer than this are skipped (ADR-027): beyond a handful of hops the
+#: chain is almost never a real recursive-trigger loop and cycle enumeration
+#: cost grows fast on dense graphs.
+_MAX_CYCLE_LENGTH = 5
 
 #: In-loop governor violations, keyed by the edge relation that carries the
 #: ``sf_in_loop`` flag. One sentinel ``concept`` node per entry (ADR-004).
@@ -125,5 +148,117 @@ def governor_limit_analysis_pass(
                     "source_file": info["source_file"],
                 }
             )
+
+    return violations
+
+
+def _has_safe_recursion_marker(node: dict) -> bool:
+    """Return True if *node* carries an intentional recursion-guard pattern.
+
+    Honors an explicit ``sf_safe_recursion`` boolean first, then scans only the
+    node's Apex ``source`` (kept by apex_enhanced.py) for a known guard pattern.
+    The class *name* / label is deliberately NOT scanned: a class merely named
+    ``…TriggerHandler`` is not itself a guard, so matching on it would be a false
+    positive (ADR-027).
+    """
+    if node.get("sf_safe_recursion"):
+        return True
+    source = node.get("source", "")
+    return isinstance(source, str) and any(
+        pat.search(source) for pat in _SAFE_RECURSION_PATTERNS
+    )
+
+
+def detect_recursive_triggers(
+    all_nodes: list[dict], all_edges: list[dict]
+) -> list[dict]:
+    """Detect recursive call cycles among Apex code nodes (ADR-027).
+
+    Builds a call graph from ``calls`` edges and reports each cycle (up to
+    :data:`_MAX_CYCLE_LENGTH` nodes) as a ``governor_violation`` edge from the
+    cycle's lexicographically-first node to the ``gov_recursive_trigger``
+    sentinel. A cycle whose nodes carry a recursion-guard pattern (static Boolean
+    flag, ``TriggerHandler`` / bypass, ``isRunning``…) is still reported but
+    tagged ``sf_safe_recursion=True`` and downgraded HIGH -> LOW: not every cycle
+    is a bug, and flagging guarded recursion as CRITICAL is a false positive
+    (ADR-027). Longer cycles are skipped to bound enumeration cost.
+
+    Pure w.r.t. ``all_edges``; appends the sentinel ``concept`` node to
+    ``all_nodes`` in place (idempotent) so the returned edges never dangle. The
+    caller does ``all_edges.extend(...)``.
+
+    Args:
+        all_nodes: Merged node list (mutated: sentinel node appended on a hit).
+        all_edges: Merged edge list (read-only).
+
+    Returns:
+        List of ``governor_violation`` edges (one per detected cycle).
+    """
+    node_by_id = {n["id"]: n for n in all_nodes}
+
+    call_graph = nx.DiGraph()
+    for edge in all_edges:
+        if edge.get("relation") != "calls":
+            continue
+        source, target = edge.get("source"), edge.get("target")
+        # Only edges between real, resolvable nodes — no dangling cycles.
+        if source in node_by_id and target in node_by_id:
+            call_graph.add_edge(source, target)
+
+    if call_graph.number_of_edges() == 0:
+        return []
+
+    # Enumerate cycles, drop any longer than the cap, and dedup by node set so a
+    # 2-cycle reported in both rotations becomes a single violation.
+    seen: set[frozenset[str]] = set()
+    cycles: list[list[str]] = []
+    for cycle in nx.simple_cycles(call_graph):
+        if len(cycle) > _MAX_CYCLE_LENGTH:
+            continue
+        key = frozenset(cycle)
+        if key in seen:
+            continue
+        seen.add(key)
+        cycles.append(cycle)
+
+    if not cycles:
+        return []
+
+    sentinel_id = "gov_recursive_trigger"
+    if sentinel_id not in node_by_id:
+        sentinel = {
+            "id": sentinel_id,
+            "label": "⚠ Recursive trigger",
+            "file_type": "concept",
+            "source_file": "",
+            "sf_violation_type": "recursive_trigger",
+        }
+        all_nodes.append(sentinel)
+        node_by_id[sentinel_id] = sentinel
+
+    violations: list[dict] = []
+    for cycle in sorted(cycles, key=lambda c: sorted(c)):
+        members = sorted(cycle)
+        safe = any(
+            _has_safe_recursion_marker(node_by_id[m]) for m in members
+        )
+        violations.append(
+            {
+                "source": members[0],
+                "target": sentinel_id,
+                "relation": "governor_violation",
+                "confidence": "INFERRED",
+                "confidence_value": 0.75,
+                "sf_violation_type": "recursive_trigger",
+                "sf_severity": "LOW" if safe else "HIGH",
+                "sf_safe_recursion": safe,
+                "sf_cycle": members,
+                "sf_reason": (
+                    "Guarded recursion (recursion-prevention pattern detected)"
+                    if safe
+                    else "Unguarded call cycle -> possible recursive trigger"
+                ),
+            }
+        )
 
     return violations

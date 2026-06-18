@@ -32,7 +32,11 @@ def register():
     from .apex_enhanced import extract_apex_enhanced
     from .flow import extract_flow
     from .lwc import extract_lwc_html, extract_lwc_js
-    from .objects import extract_custom_field, extract_custom_object
+    from .objects import (
+        extract_custom_field,
+        extract_custom_object,
+        extract_validation_rule,
+    )
     from .profiles import extract_permission_set, extract_profile
 
     _DISPATCH[".cls"] = extract_apex_enhanced
@@ -40,6 +44,7 @@ def register():
     _DISPATCH[".flow-meta.xml"] = extract_flow
     _DISPATCH[".object-meta.xml"] = extract_custom_object
     _DISPATCH[".field-meta.xml"] = extract_custom_field
+    _DISPATCH[".validationRule-meta.xml"] = extract_validation_rule
     _DISPATCH[".profile-meta.xml"] = extract_profile
     _DISPATCH[".permissionset-meta.xml"] = extract_permission_set
     _DISPATCH[".html"] = extract_lwc_html
@@ -57,12 +62,18 @@ def _parser_for(path: Path):
     from .apex_enhanced import extract_apex_enhanced
     from .flow import extract_flow
     from .lwc import extract_lwc_html, extract_lwc_js
-    from .objects import extract_custom_field, extract_custom_object
+    from .objects import (
+        extract_custom_field,
+        extract_custom_object,
+        extract_validation_rule,
+    )
     from .profiles import extract_permission_set, extract_profile
 
     name = path.name
     if name.endswith(".object-meta.xml"):
         return extract_custom_object
+    if name.endswith(".validationRule-meta.xml"):
+        return extract_validation_rule
     if name.endswith(".field-meta.xml"):
         return extract_custom_field
     if name.endswith(".flow-meta.xml"):
@@ -142,13 +153,25 @@ def extract_sf(path, **kwargs):
 
     Dispatches every supported Salesforce file under ``path`` to its parser,
     merges the results (deduping nodes by ID for cross-file resolution), then
-    runs the four SF analysis passes in the fixed ADR-011 order:
+    runs the SF analysis passes in the fixed ADR-011 order:
 
         1. ``cpq_analysis_pass``       — reclassify SBQQ__ nodes, detect QCP.
         2. ``_merge_lwc_components``   — fold LWC HTML + JS into one node.
         3. ``ooe_analysis_pass``       — Order of Execution chains.
         4. ``governor_limit_analysis_pass`` — diagnostic ``governor_violation``
            edges (appended to the edge list).
+        5. ``detect_recursive_triggers`` — recursive ``calls`` cycles as
+           ``governor_violation`` edges, guarded recursion downgraded (ADR-027).
+        6. ``permission_analysis_pass`` — Profile/FLS constraints on CPQ
+           (``gov_permission_violation`` edges, ADR-028). Runs after CPQ so
+           ``file_type == "cpq_rule"`` / ``sf_cpq_object`` are already set.
+        7. ``detect_flow_cpq_loops``   — Flow ↔ CPQ Type A loops
+           (``infinite_loop_risk`` self-edges, ADR-029).
+        8. ``validation_cpq_analysis_pass`` — CPQ Rule ↔ Validation Rule field
+           overlap (``cpq_validation_risk`` edges, ADR-030).
+
+    Passes 4–8 are pure functions returning diagnostic edges that the caller
+    appends; passes 1–3 mutate the node/edge lists in place.
 
     Args:
         path: Path to a Salesforce repository / metadata directory (or a single
@@ -160,8 +183,14 @@ def extract_sf(path, **kwargs):
         ``{"nodes": [...], "edges": [...]}`` — the merged, analyzed graph.
     """
     from .cpq import cpq_analysis_pass
-    from .governor_limits import governor_limit_analysis_pass
+    from .flow_cpq_loops import detect_flow_cpq_loops
+    from .governor_limits import (
+        detect_recursive_triggers,
+        governor_limit_analysis_pass,
+    )
     from .order_of_execution import ooe_analysis_pass
+    from .permission_analysis import permission_analysis_pass
+    from .validation_cpq import validation_cpq_analysis_pass
 
     root = Path(path)
     if root.is_file():
@@ -186,11 +215,15 @@ def extract_sf(path, **kwargs):
             _merge_into(all_nodes, node_by_id, node)
         all_edges.extend(result.get("edges", []))
 
-    # Analysis passes — fixed order (ADR-011). Each mutates in place.
+    # Analysis passes — fixed order (ADR-011). Passes 1-3 mutate in place;
+    # passes 4-7 are pure functions whose diagnostic edges are appended here.
     cpq_analysis_pass(all_nodes, all_edges)
     _merge_lwc_components(all_nodes, all_edges)
     ooe_analysis_pass(all_nodes, all_edges)
-    violations = governor_limit_analysis_pass(all_nodes, all_edges)
-    all_edges.extend(violations)
+    all_edges.extend(governor_limit_analysis_pass(all_nodes, all_edges))
+    all_edges.extend(detect_recursive_triggers(all_nodes, all_edges))
+    all_edges.extend(permission_analysis_pass(all_nodes, all_edges))
+    all_edges.extend(detect_flow_cpq_loops(all_nodes, all_edges))
+    all_edges.extend(validation_cpq_analysis_pass(all_nodes, all_edges))
 
     return {"nodes": all_nodes, "edges": all_edges}

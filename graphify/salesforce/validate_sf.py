@@ -95,7 +95,11 @@ EDGE_ATTRIBUTES_BY_RELATION: dict[str, dict[str, list[str]]] = {
     },
     "governor_violation": {
         "required": ["sf_violation_type", "sf_severity"],
-        "optional": ["sf_in_loop", "sf_reason"],
+        "optional": [
+            "sf_in_loop", "sf_reason", "sf_violation_count", "sf_limit",
+            # recursive_trigger violations (ADR-027)
+            "sf_safe_recursion", "sf_cycle",
+        ],
     },
     "cpq_validation_risk": {
         "optional": ["sf_risk_level", "sf_overlapping_fields", "sf_note"],

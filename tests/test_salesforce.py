@@ -14,7 +14,10 @@ from graphify.salesforce.constants import sobject_nid
 from graphify.salesforce.cpq import cpq_analysis_pass
 from graphify.salesforce.flow import extract_flow
 from graphify.salesforce.flow_cpq_loops import detect_flow_cpq_loops
-from graphify.salesforce.governor_limits import governor_limit_analysis_pass
+from graphify.salesforce.governor_limits import (
+    detect_recursive_triggers,
+    governor_limit_analysis_pass,
+)
 from graphify.salesforce.lwc import extract_lwc_html, extract_lwc_js
 from graphify.salesforce.neo4j_sf import (
     SF_NODE_TYPE_TO_NEO4J_LABEL,
@@ -22,11 +25,15 @@ from graphify.salesforce.neo4j_sf import (
     push_to_neo4j_sf,
     to_cypher_sf,
 )
-from graphify.salesforce.objects import extract_custom_object
+from graphify.salesforce.objects import (
+    extract_custom_object,
+    extract_validation_rule,
+)
 from graphify.salesforce.order_of_execution import ooe_analysis_pass
 from graphify.salesforce.permission_analysis import permission_analysis_pass
 from graphify.salesforce.profiles import extract_permission_set, extract_profile
 from graphify.salesforce.release_sync import check_staleness, sync_release_notes
+from graphify.salesforce.validation_cpq import validation_cpq_analysis_pass
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -828,6 +835,287 @@ def test_flow_cpq_loops() -> None:
     # Re-run safety: a pure pass yields identical results (idempotent).
     loops_2 = detect_flow_cpq_loops(all_nodes, all_edges)
     assert len(loops_2) == 2
+
+
+def test_detect_recursive_triggers() -> None:
+    """``calls`` cycles -> governor_violation; guarded recursion downgraded."""
+    all_nodes: list[dict] = [
+        # Unguarded 2-cycle: A <-> B.
+        {"id": "code_a", "label": "AccountTriggerHandlerA", "file_type": "code",
+         "sf_code_type": "class", "source": "void run() { B.go(); }"},
+        {"id": "code_b", "label": "ServiceB", "file_type": "code",
+         "sf_code_type": "class", "source": "void go() { A.run(); }"},
+        # Guarded 2-cycle: C <-> D, where C uses a static Boolean flag.
+        {"id": "code_c", "label": "ContactHandler", "file_type": "code",
+         "sf_code_type": "class",
+         "source": "private static Boolean isRunning = false;"},
+        {"id": "code_d", "label": "ContactService", "file_type": "code",
+         "sf_code_type": "class", "source": "void touch() { C.run(); }"},
+        # Acyclic edge -> never reported.
+        {"id": "code_e", "label": "Leaf", "file_type": "code",
+         "sf_code_type": "class", "source": ""},
+    ]
+    all_edges: list[dict] = [
+        {"source": "code_a", "target": "code_b", "relation": "calls",
+         "confidence": "EXTRACTED", "source_file": "A.cls"},
+        {"source": "code_b", "target": "code_a", "relation": "calls",
+         "confidence": "EXTRACTED", "source_file": "B.cls"},
+        {"source": "code_c", "target": "code_d", "relation": "calls",
+         "confidence": "EXTRACTED", "source_file": "C.cls"},
+        {"source": "code_d", "target": "code_c", "relation": "calls",
+         "confidence": "EXTRACTED", "source_file": "D.cls"},
+        {"source": "code_a", "target": "code_e", "relation": "calls",
+         "confidence": "EXTRACTED", "source_file": "A.cls"},
+    ]
+
+    edges_before = len(all_edges)
+    violations = detect_recursive_triggers(all_nodes, all_edges)
+
+    # Contract: pure w.r.t. edges; sentinel node appended once.
+    assert len(all_edges) == edges_before
+    assert sum(1 for n in all_nodes if n["id"] == "gov_recursive_trigger") == 1
+
+    by_source = {e["source"]: e for e in violations}
+    # Two distinct cycles (A/B and C/D), deduped across rotations.
+    assert len(violations) == 2
+    assert all(v["relation"] == "governor_violation" for v in violations)
+    assert all(v["sf_violation_type"] == "recursive_trigger" for v in violations)
+    assert all(v["target"] == "gov_recursive_trigger" for v in violations)
+
+    # Unguarded A/B cycle -> HIGH; guarded C/D cycle -> LOW.
+    ab = by_source["code_a"]
+    assert ab["sf_safe_recursion"] is False
+    assert ab["sf_severity"] == "HIGH"
+    assert ab["sf_cycle"] == ["code_a", "code_b"]
+
+    cd = by_source["code_c"]
+    assert cd["sf_safe_recursion"] is True
+    assert cd["sf_severity"] == "LOW"
+
+    # No dangling endpoints; idempotent re-run.
+    node_ids = {n["id"] for n in all_nodes}
+    for v in violations:
+        assert v["source"] in node_ids and v["target"] in node_ids
+    assert len(detect_recursive_triggers(all_nodes, all_edges)) == 2
+
+
+def test_validation_cpq_field_overlap() -> None:
+    """CPQ rule writing a field a same-object Validation Rule checks -> risk edge."""
+    quote_id = sobject_nid("SBQQ__Quote__c")
+    opp_id = sobject_nid("Opportunity")
+
+    all_nodes: list[dict] = [
+        # CPQ rule on Quote that writes Discount__c + NetTotal__c.
+        {"id": "cpq_discount", "label": "SBQQ__PriceRule__c Discount",
+         "file_type": "cpq_rule", "sf_cpq_object": "SBQQ__Quote__c",
+         "sf_target_fields": ["SBQQ__Quote__c.Discount__c", "NetTotal__c"],
+         "source_file": "objects/SBQQ__PriceRule__c/Discount.xml"},
+        # Validation Rule on Quote that checks Discount__c (object via sf_object).
+        {"id": "val_maxdiscount", "label": "MaxDiscount",
+         "file_type": "validation_rule", "sf_object": "SBQQ__Quote__c",
+         "sf_referenced_fields": ["Discount__c", "Approved__c"],
+         "source_file": "objects/SBQQ__Quote__c/MaxDiscount.validationRule-meta.xml"},
+        # Validation Rule on Quote, object inferred from a ``validates`` edge.
+        {"id": "val_nettotal", "label": "NetTotalPositive",
+         "file_type": "validation_rule",
+         "sf_referenced_fields": ["NetTotal__c"],
+         "source_file": "objects/SBQQ__Quote__c/NetTotalPositive.validationRule-meta.xml"},
+        # Validation Rule on a DIFFERENT object sharing a field name -> no risk.
+        {"id": "val_oppdiscount", "label": "OppDiscount",
+         "file_type": "validation_rule", "sf_object": "Opportunity",
+         "sf_referenced_fields": ["Discount__c"],
+         "source_file": "objects/Opportunity/OppDiscount.validationRule-meta.xml"},
+        quote_node := {"id": quote_id, "label": "SBQQ__Quote__c",
+                       "file_type": "sobject"},
+        {"id": opp_id, "label": "Opportunity", "file_type": "sobject"},
+    ]
+    all_edges: list[dict] = [
+        {"source": "val_nettotal", "target": quote_id, "relation": "validates",
+         "confidence": "EXTRACTED", "source_file": quote_node["label"]},
+        {"source": "val_oppdiscount", "target": opp_id, "relation": "validates",
+         "confidence": "EXTRACTED", "source_file": "Opportunity"},
+    ]
+
+    input_nodes_obj = all_nodes
+    input_edges_obj = all_edges
+    nodes_before = len(all_nodes)
+    edges_before = len(all_edges)
+
+    risks = validation_cpq_analysis_pass(all_nodes, all_edges)
+
+    # Contract: pure function — returns risk edges, mutates neither list.
+    assert isinstance(risks, list)
+    assert all_nodes is input_nodes_obj
+    assert all_edges is input_edges_obj
+    assert len(all_nodes) == nodes_before
+    assert len(all_edges) == edges_before
+
+    by_target = {e["target"]: e for e in risks}
+
+    # 1. Two risks: Discount__c overlap (sf_object) + NetTotal__c (validates edge).
+    #    The cross-object Discount__c clash is NOT reported.
+    assert set(by_target) == {"val_maxdiscount", "val_nettotal"}
+
+    # 2. Discount__c overlap on Quote -> well-formed cpq_validation_risk edge.
+    discount = by_target["val_maxdiscount"]
+    assert discount["source"] == "cpq_discount"
+    assert discount["relation"] == "cpq_validation_risk"
+    assert discount["confidence"] == "INFERRED"
+    assert discount["confidence_value"] == 0.7
+    assert discount["sf_risk_level"] == "MEDIUM"
+    assert discount["sf_overlapping_fields"] == ["discount__c"]  # bare, normalized
+
+    # 3. Object inferred from the ``validates`` edge still matches (NetTotal__c).
+    nettotal = by_target["val_nettotal"]
+    assert nettotal["sf_overlapping_fields"] == ["nettotal__c"]
+
+    # 4. No dangling edges; both endpoints reference existing nodes.
+    node_ids = {n["id"] for n in all_nodes}
+    for risk in risks:
+        assert risk["source"] in node_ids, f"dangling source: {risk}"
+        assert risk["target"] in node_ids, f"dangling target: {risk}"
+
+    # Re-run safety: a pure pass yields identical results (idempotent).
+    assert len(validation_cpq_analysis_pass(all_nodes, all_edges)) == len(risks)
+
+
+def test_validation_cpq_no_field_data_yields_nothing() -> None:
+    """Without field data on either side, the pass emits no false positives."""
+    quote_id = sobject_nid("SBQQ__Quote__c")
+    nodes = [
+        {"id": "cpq_x", "label": "SBQQ__PriceRule__c X", "file_type": "cpq_rule",
+         "sf_cpq_object": "SBQQ__Quote__c"},  # no sf_target_fields
+        {"id": "val_x", "label": "ValX", "file_type": "validation_rule",
+         "sf_object": "SBQQ__Quote__c"},  # no sf_referenced_fields
+        {"id": quote_id, "label": "SBQQ__Quote__c", "file_type": "sobject"},
+    ]
+    assert validation_cpq_analysis_pass(nodes, []) == []
+
+
+def test_validation_rule_parser_standalone(tmp_path: Path) -> None:
+    """A standalone *.validationRule-meta.xml -> validation_rule node + validates edge."""
+    vr = (
+        tmp_path / "objects" / "SBQQ__Quote__c" / "validationRules"
+        / "MaxDiscount.validationRule-meta.xml"
+    )
+    vr.parent.mkdir(parents=True)
+    vr.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <fullName>MaxDiscount</fullName>\n"
+        "  <active>true</active>\n"
+        "  <errorConditionFormula>AND(ISCHANGED(SBQQ__Discount__c), "
+        "SBQQ__Discount__c &gt; 50)</errorConditionFormula>\n"
+        "</ValidationRule>\n",
+        encoding="utf-8",
+    )
+    result = extract_validation_rule(vr)
+    assert "error" not in result
+    _assert_no_dangling_edges(result)
+
+    rule = next(n for n in result["nodes"] if n["file_type"] == "validation_rule")
+    assert rule["sf_object"] == "SBQQ__Quote__c"
+    assert rule["sf_active"] is True
+    # Function tokens (AND/ISCHANGED) filtered; the field is kept (deduped).
+    assert rule["sf_referenced_fields"] == ["SBQQ__Discount__c"]
+
+    validates = [e for e in result["edges"] if e["relation"] == "validates"]
+    assert len(validates) == 1
+    assert validates[0]["source"] == rule["id"]
+    assert validates[0]["target"] == sobject_nid("SBQQ__Quote__c")
+
+
+def test_validation_rule_parser_embedded(tmp_path: Path) -> None:
+    """<validationRules> embedded in an object-meta.xml are extracted too."""
+    obj = tmp_path / "SBQQ__Quote__c.object-meta.xml"
+    obj.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <label>SBQQ__Quote__c</label>\n"
+        "  <validationRules>\n"
+        "    <fullName>NetTotalPositive</fullName>\n"
+        "    <active>true</active>\n"
+        "    <errorConditionFormula>NetTotal__c &lt; 0</errorConditionFormula>\n"
+        "  </validationRules>\n"
+        "</CustomObject>\n",
+        encoding="utf-8",
+    )
+    result = extract_custom_object(obj)
+    _assert_no_dangling_edges(result)
+
+    rule = next(n for n in result["nodes"] if n["file_type"] == "validation_rule")
+    assert rule["label"] == "NetTotalPositive"
+    assert rule["sf_referenced_fields"] == ["NetTotal__c"]
+    assert any(
+        e["relation"] == "validates" and e["target"] == sobject_nid("SBQQ__Quote__c")
+        for e in result["edges"]
+    )
+
+
+def test_cpq_qcp_field_writes_populate_target_fields() -> None:
+    """cpq_analysis_pass records the fields a QCP plugin writes (sf_target_fields)."""
+    qcp_source = (
+        "global class QuoteCalculator implements SBQQ.QuoteCalculatorPlugin {\n"
+        "  global void calculate(SBQQ.QuoteModel quote, "
+        "List<SBQQ.QuoteLineModel> lines) {\n"
+        "    quote.SBQQ__Discount__c = 10;\n"
+        "    line.put('NetTotal__c', 5);\n"
+        "    Boolean ok = a == b;\n"  # '==' must NOT be read as a field write
+        "  }\n"
+        "}\n"
+    )
+    nodes = [
+        {"id": "apex_quotecalculator", "label": "QuoteCalculator",
+         "file_type": "code", "sf_code_type": "class", "source": qcp_source},
+    ]
+    cpq_analysis_pass(nodes, [])
+
+    qcp = nodes[0]
+    assert qcp["sf_qcp_implementation"] is True
+    assert set(qcp["sf_target_fields"]) == {"SBQQ__Discount__c", "NetTotal__c"}
+    assert qcp["sf_cpq_object"] == "SBQQ__Quote__c"
+
+
+def test_validation_cpq_fires_end_to_end(tmp_path: Path) -> None:
+    """extract_sf wires QCP writes + Validation Rule into a cpq_validation_risk edge."""
+    default = tmp_path / "force-app" / "main" / "default"
+    (default / "classes").mkdir(parents=True)
+    (default / "objects" / "SBQQ__Quote__c" / "validationRules").mkdir(parents=True)
+
+    # QCP plugin that writes SBQQ__Discount__c on the Quote.
+    (default / "classes" / "QuoteCalculator.cls").write_text(
+        "global class QuoteCalculator implements SBQQ.QuoteCalculatorPlugin {\n"
+        "  global void calculate(SBQQ.QuoteModel quote, "
+        "List<SBQQ.QuoteLineModel> lines) {\n"
+        "    quote.SBQQ__Discount__c = 10;\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    # Validation Rule on the same Quote object that checks SBQQ__Discount__c.
+    (
+        default / "objects" / "SBQQ__Quote__c" / "validationRules"
+        / "MaxDiscount.validationRule-meta.xml"
+    ).write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <fullName>MaxDiscount</fullName>\n"
+        "  <errorConditionFormula>SBQQ__Discount__c &gt; 50</errorConditionFormula>\n"
+        "</ValidationRule>\n",
+        encoding="utf-8",
+    )
+
+    result = extract_sf(tmp_path)
+    _assert_no_dangling_edges(result)
+
+    risks = [e for e in result["edges"] if e["relation"] == "cpq_validation_risk"]
+    assert risks, "expected a CPQ ↔ Validation overlap edge"
+    risk = risks[0]
+    assert risk["sf_overlapping_fields"] == ["sbqq__discount__c"]
+    assert risk["confidence"] == "INFERRED"
+
+    # The Validation Rule parser also feeds the OoE pass with a ``validates`` edge.
+    assert any(e["relation"] == "validates" for e in result["edges"])
 
 
 def test_objects_parser_xml_parse_error(tmp_path: Path) -> None:
