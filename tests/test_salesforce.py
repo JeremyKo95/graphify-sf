@@ -26,6 +26,11 @@ from graphify.salesforce.neo4j_sf import (
     push_to_neo4j_sf,
     to_cypher_sf,
 )
+from graphify.salesforce.metadata import (
+    extract_permission_set_group,
+    extract_record_type,
+    extract_workflow,
+)
 from graphify.salesforce.objects import (
     extract_custom_object,
     extract_validation_rule,
@@ -1377,6 +1382,63 @@ def test_viz_build_self_contained_html(tmp_path: Path) -> None:
     assert "<!DOCTYPE html>" in html
     assert "fetch(" not in html  # data embedded inline, not fetched (no CORS)
     assert "apex_accounttrigger" in html  # graph data is embedded
+
+
+def test_record_type_parser(tmp_path: Path) -> None:
+    """*.recordType-meta.xml -> record_type node + record_type_of edge to SObject."""
+    rt = (tmp_path / "objects" / "SBQQ__Quote__c" / "recordTypes"
+          / "Builder.recordType-meta.xml")
+    rt.parent.mkdir(parents=True)
+    rt.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<RecordType xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <fullName>Builder</fullName><active>true</active><label>Builder Quote</label>\n"
+        "</RecordType>\n", encoding="utf-8")
+    result = extract_record_type(rt)
+    _assert_no_dangling_edges(result)
+    node = next(n for n in result["nodes"] if n["file_type"] == "record_type")
+    assert node["sf_object"] == "SBQQ__Quote__c"
+    assert node["label"] == "Builder Quote"
+    edge = next(e for e in result["edges"] if e["relation"] == "record_type_of")
+    assert edge["source"] == node["id"]
+    assert edge["target"] == sobject_nid("SBQQ__Quote__c")
+
+
+def test_permission_set_group_parser(tmp_path: Path) -> None:
+    """*.permissionsetgroup-meta.xml -> PSG node + contains_permission_set edges."""
+    psg = tmp_path / "Sales_PSG.permissionsetgroup-meta.xml"
+    psg.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<PermissionSetGroup xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <label>Sales PSG</label>\n"
+        "  <permissionSets>CPQ_User</permissionSets>\n"
+        "  <permissionSets>Quote_Editor</permissionSets>\n"
+        "</PermissionSetGroup>\n", encoding="utf-8")
+    result = extract_permission_set_group(psg)
+    _assert_no_dangling_edges(result)
+    psg_node = next(n for n in result["nodes"] if n["file_type"] == "permission_set_group")
+    members = {e["target"] for e in result["edges"]
+              if e["relation"] == "contains_permission_set"}
+    # Resolves to the same permission_set_<name> ID profiles.py emits.
+    assert members == {"permission_set_cpq_user", "permission_set_quote_editor"}
+    assert all(e["source"] == psg_node["id"] for e in result["edges"])
+
+
+def test_workflow_parser(tmp_path: Path) -> None:
+    """workflows/<Object>.workflow-meta.xml fieldUpdates -> dml_operates_on UPDATE."""
+    wf = tmp_path / "workflows" / "Opportunity.workflow-meta.xml"
+    wf.parent.mkdir(parents=True)
+    wf.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Workflow xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <fieldUpdates><fullName>Set_Stage</fullName><field>StageName</field></fieldUpdates>\n"
+        "</Workflow>\n", encoding="utf-8")
+    result = extract_workflow(wf)
+    _assert_no_dangling_edges(result)
+    dml = next(e for e in result["edges"] if e["relation"] == "dml_operates_on")
+    assert dml["target"] == sobject_nid("Opportunity")
+    assert dml["sf_dml_type"] == "UPDATE"
+    assert dml["sf_automation"] == "workflow"
 
 
 def test_objects_parser_xml_parse_error(tmp_path: Path) -> None:

@@ -36,6 +36,9 @@ SF_FILE_TYPES = {
     "cpq_action",       # CPQ Price/Product Action record (cpq_data)
     "aura_component",   # Aura Component (legacy)
     "validation_rule",  # Validation Rule (ADR-030)
+    "record_type",          # Record Type (objects/<Obj>/recordTypes)
+    "permission_set_group", # Permission Set Group
+    "workflow",             # Workflow rule set (per SObject)
 }
 
 
@@ -59,6 +62,10 @@ SF_RELATIONS = {
     # Permission
     "grants_access_to",     # Profile/PermSet -> Object/Field
     "field_of",             # Custom Field -> Custom Object
+    "contains_permission_set",  # Permission Set Group -> Permission Set
+
+    # Metadata coverage
+    "record_type_of",       # Record Type -> SObject
 
     # CPQ
     "cpq_applies_to",       # CPQ Rule/QCP -> target object
@@ -141,9 +148,12 @@ def validate_sf_graph(G: nx.DiGraph) -> list[str]:
     """
     errors: list[str] = []
 
-    # Check 1: SObject node ID prefix convention
-    for node in G.nodes():
-        if "sobject" in str(node) and not str(node).startswith("sobject_"):
+    # Check 1: SObject node ID prefix convention. Only nodes that ARE SObjects
+    # (file_type == "sobject") must follow it — a substring match on "sobject"
+    # would wrongly flag Apex named ``SObjectUtil`` / methods like
+    # ``getSObjectName`` (real-org false positives).
+    for node, data in G.nodes(data=True):
+        if data.get("file_type") == "sobject" and not str(node).startswith("sobject_"):
             errors.append(f"Malformed SObject node ID: {node}")
 
     # Check 2: Order of Execution chain must be a DAG

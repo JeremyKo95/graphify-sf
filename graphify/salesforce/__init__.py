@@ -32,6 +32,11 @@ def register():
     from .apex_enhanced import extract_apex_enhanced
     from .flow import extract_flow
     from .lwc import extract_lwc_html, extract_lwc_js
+    from .metadata import (
+        extract_permission_set_group,
+        extract_record_type,
+        extract_workflow,
+    )
     from .objects import (
         extract_custom_field,
         extract_custom_object,
@@ -45,6 +50,9 @@ def register():
     _DISPATCH[".object-meta.xml"] = extract_custom_object
     _DISPATCH[".field-meta.xml"] = extract_custom_field
     _DISPATCH[".validationRule-meta.xml"] = extract_validation_rule
+    _DISPATCH[".recordType-meta.xml"] = extract_record_type
+    _DISPATCH[".workflow-meta.xml"] = extract_workflow
+    _DISPATCH[".permissionsetgroup-meta.xml"] = extract_permission_set_group
     _DISPATCH[".profile-meta.xml"] = extract_profile
     _DISPATCH[".permissionset-meta.xml"] = extract_permission_set
     _DISPATCH[".html"] = extract_lwc_html
@@ -62,6 +70,11 @@ def _parser_for(path: Path):
     from .apex_enhanced import extract_apex_enhanced
     from .flow import extract_flow
     from .lwc import extract_lwc_html, extract_lwc_js
+    from .metadata import (
+        extract_permission_set_group,
+        extract_record_type,
+        extract_workflow,
+    )
     from .objects import (
         extract_custom_field,
         extract_custom_object,
@@ -74,6 +87,12 @@ def _parser_for(path: Path):
         return extract_custom_object
     if name.endswith(".validationRule-meta.xml"):
         return extract_validation_rule
+    if name.endswith(".recordType-meta.xml"):
+        return extract_record_type
+    if name.endswith(".workflow-meta.xml"):
+        return extract_workflow
+    if name.endswith(".permissionsetgroup-meta.xml"):
+        return extract_permission_set_group
     if name.endswith(".field-meta.xml"):
         return extract_custom_field
     if name.endswith(".flow-meta.xml"):
