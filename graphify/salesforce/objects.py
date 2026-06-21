@@ -139,6 +139,14 @@ def extract_custom_object(path: Path) -> dict:
     ]
     edges: list[dict] = []
 
+    # 1b. Custom Setting enrichment — a CustomObject with <customSettingsType>
+    # is a List/Hierarchy Custom Setting, not a real table. Tag the SObject node
+    # so impact / governor analysis treats it as config storage (no SOQL limits).
+    setting_type = root.findtext("md:customSettingsType", namespaces=_NS)
+    if setting_type:
+        nodes[0]["sf_is_custom_setting"] = True
+        nodes[0]["sf_setting_type"] = setting_type
+
     # 2. Field nodes + field_of edges -------------------------------------
     for field_elem in root.findall("md:fields", namespaces=_NS):
         field_name = field_elem.findtext("md:fullName", namespaces=_NS)

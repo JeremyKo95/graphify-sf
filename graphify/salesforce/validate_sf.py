@@ -39,6 +39,10 @@ SF_FILE_TYPES = {
     "record_type",          # Record Type (objects/<Obj>/recordTypes)
     "permission_set_group", # Permission Set Group
     "workflow",             # Workflow rule set (per SObject)
+    "field",                # Custom Field (objects.py)
+    "cmt_record",           # Custom Metadata record (customMetadata/<Type>.<Record>)
+    "sharing_rule",         # Sharing Rule (owner/criteria/guest/territory)
+    "custom_label",         # Custom Label ($Label.X reference target)
 }
 
 
@@ -66,6 +70,8 @@ SF_RELATIONS = {
 
     # Metadata coverage
     "record_type_of",       # Record Type -> SObject
+    "cmt_record_of",        # Custom Metadata record -> <Type>__mdt SObject
+    "shares",               # Sharing Rule -> SObject
 
     # CPQ
     "cpq_applies_to",       # CPQ Rule/QCP -> target object

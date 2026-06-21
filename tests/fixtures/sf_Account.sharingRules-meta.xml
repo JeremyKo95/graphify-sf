@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<SharingRules xmlns="http://soap.sforce.com/2006/04/metadata">
+    <sharingOwnerRules>
+        <fullName>Account_Share_Sales</fullName>
+        <accessLevel>Edit</accessLevel>
+        <label>Account Share to Sales</label>
+        <sharedTo>
+            <group>Sales_Team</group>
+        </sharedTo>
+        <sharedFrom>
+            <roleAndSubordinates>VP_Sales</roleAndSubordinates>
+        </sharedFrom>
+    </sharingOwnerRules>
+    <sharingCriteriaRules>
+        <fullName>Account_High_Value</fullName>
+        <accessLevel>Read</accessLevel>
+        <label>High Value Accounts</label>
+        <sharedTo>
+            <role>Partner_Manager</role>
+        </sharedTo>
+        <criteriaItems>
+            <field>AnnualRevenue</field>
+            <operation>greaterThan</operation>
+            <value>1000000</value>
+        </criteriaItems>
+    </sharingCriteriaRules>
+</SharingRules>

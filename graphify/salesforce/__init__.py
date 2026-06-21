@@ -33,8 +33,11 @@ def register():
     from .flow import extract_flow
     from .lwc import extract_lwc_html, extract_lwc_js
     from .metadata import (
+        extract_custom_labels,
+        extract_custom_metadata_record,
         extract_permission_set_group,
         extract_record_type,
+        extract_sharing_rules,
         extract_workflow,
     )
     from .objects import (
@@ -53,6 +56,9 @@ def register():
     _DISPATCH[".recordType-meta.xml"] = extract_record_type
     _DISPATCH[".workflow-meta.xml"] = extract_workflow
     _DISPATCH[".permissionsetgroup-meta.xml"] = extract_permission_set_group
+    _DISPATCH[".md-meta.xml"] = extract_custom_metadata_record
+    _DISPATCH[".sharingRules-meta.xml"] = extract_sharing_rules
+    _DISPATCH[".labels-meta.xml"] = extract_custom_labels
     _DISPATCH[".profile-meta.xml"] = extract_profile
     _DISPATCH[".permissionset-meta.xml"] = extract_permission_set
     _DISPATCH[".html"] = extract_lwc_html
@@ -71,8 +77,11 @@ def _parser_for(path: Path):
     from .flow import extract_flow
     from .lwc import extract_lwc_html, extract_lwc_js
     from .metadata import (
+        extract_custom_labels,
+        extract_custom_metadata_record,
         extract_permission_set_group,
         extract_record_type,
+        extract_sharing_rules,
         extract_workflow,
     )
     from .objects import (
@@ -93,6 +102,12 @@ def _parser_for(path: Path):
         return extract_workflow
     if name.endswith(".permissionsetgroup-meta.xml"):
         return extract_permission_set_group
+    if name.endswith(".md-meta.xml"):
+        return extract_custom_metadata_record
+    if name.endswith(".sharingRules-meta.xml"):
+        return extract_sharing_rules
+    if name.endswith(".labels-meta.xml"):
+        return extract_custom_labels
     if name.endswith(".field-meta.xml"):
         return extract_custom_field
     if name.endswith(".flow-meta.xml"):

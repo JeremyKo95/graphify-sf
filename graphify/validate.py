@@ -2,7 +2,13 @@
 from __future__ import annotations
 
 VALID_FILE_TYPES = {"code", "document", "paper", "image", "rationale", "concept",
-                    "sobject", "flow", "lwc_component", "profile", "permission_set", "cpq_rule", "cpq_qcp_method", "aura_component"}
+                    "sobject", "flow", "lwc_component", "profile", "permission_set", "cpq_rule", "cpq_qcp_method", "aura_component",
+                    # Salesforce vocabulary — mirror of validate_sf.SF_FILE_TYPES so
+                    # base validation accepts SF nodes (kept in sync manually; SF is a
+                    # lower layer that must not import this module).
+                    "field", "validation_rule", "record_type", "permission_set_group",
+                    "workflow", "cpq_condition", "cpq_action",
+                    "cmt_record", "sharing_rule", "custom_label"}
 VALID_CONFIDENCES = {"EXTRACTED", "INFERRED", "AMBIGUOUS"}
 REQUIRED_NODE_FIELDS = {"id", "label", "file_type", "source_file"}
 REQUIRED_EDGE_FIELDS = {"source", "target", "relation", "confidence", "source_file"}

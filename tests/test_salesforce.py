@@ -27,8 +27,11 @@ from graphify.salesforce.neo4j_sf import (
     to_cypher_sf,
 )
 from graphify.salesforce.metadata import (
+    extract_custom_labels,
+    extract_custom_metadata_record,
     extract_permission_set_group,
     extract_record_type,
+    extract_sharing_rules,
     extract_workflow,
 )
 from graphify.salesforce.objects import (
@@ -1439,6 +1442,66 @@ def test_workflow_parser(tmp_path: Path) -> None:
     assert dml["target"] == sobject_nid("Opportunity")
     assert dml["sf_dml_type"] == "UPDATE"
     assert dml["sf_automation"] == "workflow"
+
+
+def test_custom_metadata_record_parser() -> None:
+    """customMetadata/<Type>.<Record>.md-meta.xml -> cmt_record node + cmt_record_of edge.
+
+    The <values> field/value pairs are kept as sf_values — this is the config DATA
+    that drives, e.g., the Opportunity->Quote field mapping (North Star).
+    """
+    result = extract_custom_metadata_record(
+        FIXTURES / "sf_OppToQuoteMapping.Default.md-meta.xml")
+    _assert_no_dangling_edges(result)
+    node = next(n for n in result["nodes"] if n["file_type"] == "cmt_record")
+    assert node["sf_mdt_type"] == "sf_OppToQuoteMapping__mdt"
+    assert node["sf_record_name"] == "Default"
+    # Field/value pairs captured as config data.
+    assert node["sf_values"]["Source_Field__c"] == "Opportunity.Amount"
+    assert node["sf_values"]["Target_Field__c"] == "SBQQ__Quote__c.SBQQ__NetAmount__c"
+    edge = next(e for e in result["edges"] if e["relation"] == "cmt_record_of")
+    assert edge["source"] == node["id"]
+    assert edge["target"] == sobject_nid("sf_OppToQuoteMapping__mdt")
+
+
+def test_sharing_rules_parser() -> None:
+    """<Object>.sharingRules-meta.xml -> sharing_rule node + shares edge per rule."""
+    result = extract_sharing_rules(FIXTURES / "sf_Account.sharingRules-meta.xml")
+    _assert_no_dangling_edges(result)
+    rules = {n["label"]: n for n in result["nodes"] if n["file_type"] == "sharing_rule"}
+    # Both owner and criteria rules are captured.
+    assert "Account Share to Sales" in rules
+    assert "High Value Accounts" in rules
+    owner = rules["Account Share to Sales"]
+    assert owner["sf_access_level"] == "Edit"
+    assert owner["sf_shared_to"] == "Sales_Team"
+    assert owner["sf_rule_type"] == "sharingOwnerRules"
+    # Every rule shares to the (filename-derived) SObject.
+    targets = {e["target"] for e in result["edges"] if e["relation"] == "shares"}
+    assert targets == {sobject_nid("sf_Account")}
+
+
+def test_custom_labels_parser() -> None:
+    """*.labels-meta.xml -> one custom_label node per <labels> (no edges)."""
+    result = extract_custom_labels(FIXTURES / "sf_CustomLabels.labels-meta.xml")
+    assert result["edges"] == []  # reference targets only, until $Label resolution
+    labels = {n["id"]: n for n in result["nodes"]}
+    assert "label_quote_error_message" in labels
+    err = labels["label_quote_error_message"]
+    assert err["file_type"] == "custom_label"
+    assert err["sf_categories"] == "CPQ"
+    assert err["sf_protected"] is True
+    assert err["sf_value"].startswith("Quote cannot be created")
+
+
+def test_custom_setting_enrichment() -> None:
+    """A CustomObject with <customSettingsType> is tagged as a Custom Setting."""
+    from graphify.salesforce.objects import extract_custom_object
+
+    result = extract_custom_object(FIXTURES / "sf_AppConfig__c.object-meta.xml")
+    sobj = next(n for n in result["nodes"] if n["file_type"] == "sobject")
+    assert sobj["sf_is_custom_setting"] is True
+    assert sobj["sf_setting_type"] == "List"
 
 
 def test_objects_parser_xml_parse_error(tmp_path: Path) -> None:
