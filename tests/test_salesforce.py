@@ -1494,6 +1494,58 @@ def test_custom_labels_parser() -> None:
     assert err["sf_value"].startswith("Quote cannot be created")
 
 
+def test_mdt_mapping_pass_separated_form() -> None:
+    """Real-org Main/Second __mdt record -> directed maps_to field edge (Opp->Quote)."""
+    from graphify.salesforce.mdt_mapping import mdt_mapping_pass
+    from graphify.salesforce.objects import _field_nid
+
+    record = {
+        "id": "cmt_opportunity_to_quote_mapping_rdd", "label": "RDD",
+        "file_type": "cmt_record", "source_file": "customMetadata/x.md-meta.xml",
+        "sf_mdt_type": "Opportunity_To_Quote_Mapping__mdt",
+        "sf_values": {
+            "Main_Object__c": "Opportunity",
+            "Main_Object_Api_Field__c": "RequestedDeliveryDate__c",
+            "Second_Object__c": "SBQQ__Quote__c",
+            "Second_Object_Api_Field__c": "Requested_Delivery_Date__c",
+        },
+    }
+    nodes = [record]
+    edges: list[dict] = []
+    new = mdt_mapping_pass(nodes, edges)
+    assert len(new) == 1
+    edge = new[0]
+    # Direction: Main (source) -> Second (target).
+    assert edge["source"] == _field_nid("RequestedDeliveryDate__c")
+    assert edge["target"] == _field_nid("Requested_Delivery_Date__c")
+    assert edge["relation"] == "maps_to"
+    assert edge["confidence"] == "INFERRED"
+    assert edge["sf_source_object"] == "Opportunity"
+    assert edge["sf_target_object"] == "SBQQ__Quote__c"
+    assert edge["sf_via"] == record["id"]
+    # Field stub nodes added for both endpoints -> no dangling edge.
+    ids = {n["id"] for n in nodes}
+    assert edge["source"] in ids and edge["target"] in ids
+
+
+def test_mdt_mapping_pass_dotted_form() -> None:
+    """Dotted Object.Field values with source/target key hints -> directed edge."""
+    from graphify.salesforce.metadata import extract_custom_metadata_record
+    from graphify.salesforce.mdt_mapping import mdt_mapping_pass
+    from graphify.salesforce.objects import _field_nid
+
+    parsed = extract_custom_metadata_record(
+        FIXTURES / "sf_OppToQuoteMapping.Default.md-meta.xml")
+    nodes = list(parsed["nodes"])
+    edges = list(parsed["edges"])
+    new = mdt_mapping_pass(nodes, edges)
+    maps = [e for e in new if e["relation"] == "maps_to"]
+    assert len(maps) == 1
+    assert maps[0]["source"] == _field_nid("Amount")
+    assert maps[0]["target"] == _field_nid("SBQQ__NetAmount__c")
+    assert maps[0]["confidence"] == "INFERRED"
+
+
 def test_custom_setting_enrichment() -> None:
     """A CustomObject with <customSettingsType> is tagged as a Custom Setting."""
     from graphify.salesforce.objects import extract_custom_object

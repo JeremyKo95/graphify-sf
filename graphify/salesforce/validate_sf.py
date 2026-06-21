@@ -72,6 +72,7 @@ SF_RELATIONS = {
     "record_type_of",       # Record Type -> SObject
     "cmt_record_of",        # Custom Metadata record -> <Type>__mdt SObject
     "shares",               # Sharing Rule -> SObject
+    "maps_to",              # field -> field (Custom Metadata field-mapping record)
 
     # CPQ
     "cpq_applies_to",       # CPQ Rule/QCP -> target object

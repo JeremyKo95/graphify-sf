@@ -192,6 +192,8 @@ def extract_sf(path, *, cpq_data_dir=None, **kwargs):
 
         1. ``cpq_analysis_pass``       — reclassify SBQQ__ nodes, detect QCP.
         2. ``_merge_lwc_components``   — fold LWC HTML + JS into one node.
+        2b. ``mdt_mapping_pass``       — turn field-mapping ``__mdt`` records into
+           traversable ``maps_to`` field->field edges (e.g. Opp->Quote).
         3. ``ooe_analysis_pass``       — Order of Execution chains.
         4. ``governor_limit_analysis_pass`` — diagnostic ``governor_violation``
            edges (appended to the edge list).
@@ -222,6 +224,7 @@ def extract_sf(path, *, cpq_data_dir=None, **kwargs):
     """
     from .cpq import cpq_analysis_pass
     from .flow_cpq_loops import detect_flow_cpq_loops
+    from .mdt_mapping import mdt_mapping_pass
     from .governor_limits import (
         detect_recursive_triggers,
         governor_limit_analysis_pass,
@@ -268,6 +271,7 @@ def extract_sf(path, *, cpq_data_dir=None, **kwargs):
     # passes 4-7 are pure functions whose diagnostic edges are appended here.
     cpq_analysis_pass(all_nodes, all_edges)
     _merge_lwc_components(all_nodes, all_edges)
+    mdt_mapping_pass(all_nodes, all_edges)
     ooe_analysis_pass(all_nodes, all_edges)
     all_edges.extend(governor_limit_analysis_pass(all_nodes, all_edges))
     all_edges.extend(detect_recursive_triggers(all_nodes, all_edges))
