@@ -77,6 +77,102 @@ python -m graphify.serve graphify-out/graph.json
 
 Run the test suite with `pytest tests/test_salesforce.py -v`.
 
+## Use it from an AI agent (Claude, Copilot, Cursor, …)
+
+The point of `graphify-sf` is that an agent answers Salesforce questions from the
+**graph** instead of reading raw metadata — so it stays accurate and token-cheap. The
+flow is always: **extract once → expose the graph → the agent queries it.**
+
+### Step 1 — build the graph (once per org snapshot)
+
+```bash
+python -m graphify.salesforce extract path/to/sf-repo \
+  --output-dir graphify-out --cpq-data path/to/cpq-records
+# → graphify-out/graph.json
+```
+
+Re-run after a metadata pull to refresh it.
+
+### Option A — MCP server (recommended)
+
+Serve the graph over MCP; the agent gets token-bounded Salesforce tools
+(`sf_impact`, `sf_violations`, `sf_cpq_chain`, `sf_ooe`) plus the base graph tools
+(`query_graph`, `graph_stats`, `god_nodes`, `shortest_path`, `get_neighbors`, …).
+
+```bash
+# stdio transport (default — what desktop agents launch)
+python -m graphify.serve graphify-out/graph.json
+# or the console script after `pip install -e .`
+graphify-mcp graphify-out/graph.json
+# shared HTTP transport (team / remote)
+python -m graphify.serve graphify-out/graph.json --transport http --port 8080
+```
+
+**Claude Code** — one command (use an absolute path to `graph.json`):
+
+```bash
+claude mcp add graphify-sf -- python -m graphify.serve /abs/path/to/graphify-out/graph.json
+```
+
+**Claude Desktop / Cursor / Windsurf** — add to the MCP config
+(`claude_desktop_config.json`, `.cursor/mcp.json`, …); they share this shape:
+
+```json
+{
+  "mcpServers": {
+    "graphify-sf": {
+      "command": "python",
+      "args": ["-m", "graphify.serve", "/abs/path/to/graphify-out/graph.json"]
+    }
+  }
+}
+```
+
+**VS Code / GitHub Copilot** — `.vscode/mcp.json` uses the `servers` key:
+
+```json
+{
+  "servers": {
+    "graphify-sf": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "graphify.serve", "/abs/path/to/graphify-out/graph.json"]
+    }
+  }
+}
+```
+
+Then just ask, e.g. *"What breaks if I change `Opportunity.Amount`? Use graphify-sf."*
+
+### Option B — no MCP (CLI the agent shells out to)
+
+For agents that run shell commands but have no MCP, point them at the CLI — each
+command prints a token-bounded answer to stdout:
+
+```bash
+python -m graphify.salesforce impact <node-id> --direction downstream
+python -m graphify.salesforce violations --severity HIGH
+python -m graphify.salesforce cpq-chain SBQQ__Quote__c
+python -m graphify.salesforce ooe Opportunity
+```
+
+### Tell the agent to use it on every task
+
+Drop a short rule into the agent's project-instructions file — `CLAUDE.md` (Claude
+Code), `.github/copilot-instructions.md` (Copilot), `.cursorrules` (Cursor), or
+`AGENTS.md`:
+
+```markdown
+## Salesforce knowledge graph
+Before answering Salesforce impact / CPQ / Order-of-Execution / Governor-Limit
+questions, consult the graphify-sf graph instead of reading raw metadata:
+- If the `graphify-sf` MCP server is connected, call `sf_impact` / `sf_violations` /
+  `sf_cpq_chain` / `sf_ooe`.
+- Otherwise run `python -m graphify.salesforce <impact|violations|cpq-chain|ooe> …`.
+Rebuild it with `python -m graphify.salesforce extract <repo> --cpq-data <dir>`
+after pulling fresh metadata.
+```
+
 ## Coverage
 
 | Area | Module | Status |
