@@ -122,15 +122,29 @@ def _build_var_types(source: str) -> dict[str, str]:
     return var_types
 
 
+def _is_sobject_name(name: str) -> bool:
+    """Reject tokens that a ``FROM`` clause can name but are not SObject roots.
+
+    A child-relationship subquery (``SELECT Id, (SELECT Id FROM Contacts__r) ...``)
+    puts a ``__r`` relationship name after ``FROM`` — that is a traversal, never a
+    queryable SObject, so it must not become an ``sobject`` node (real-org label
+    mis-extraction; ADR-019). Non-SObject keywords are filtered too.
+    """
+    return not name.lower().endswith("__r") and name not in _NON_SOBJECT_TYPES
+
+
 def _detect_soql_objects(source: str) -> list[tuple[str, int, bool]]:
     """Detect SObjects queried via SOQL.
 
-    Returns a list of ``(sobject_name, line_no, in_loop)`` tuples.
+    Returns a list of ``(sobject_name, line_no, in_loop)`` tuples. Child-relationship
+    (``__r``) subquery targets are skipped (see ``_is_sobject_name``).
     """
     loop_ranges = _find_loop_ranges(source)
     results: list[tuple[str, int, bool]] = []
     for match in _SOQL_RE.finditer(source):
         sobject = match.group(1)
+        if not _is_sobject_name(sobject):
+            continue
         line_no = source[: match.start()].count("\n") + 1
         results.append((sobject, line_no, _in_loop(line_no, loop_ranges)))
     return results

@@ -144,6 +144,27 @@ def test_apex_parser() -> None:
         for e in cls_dml
     )
 
+
+def test_apex_soql_relationship_subquery_not_sobject(tmp_path: Path) -> None:
+    """A ``__r`` child-relationship subquery target must NOT become an sobject.
+
+    Real-org label mis-extraction (ADR-019): the inner ``FROM Contacts__r`` is a
+    relationship traversal, not a queryable SObject. Only the root Account is.
+    """
+    cls = tmp_path / "RelQuery.cls"
+    cls.write_text(
+        "public class RelQuery {\n"
+        "  public void run() {\n"
+        "    List<Account> a = [SELECT Id FROM Account];\n"
+        "    List<Account> b = [SELECT Id, (SELECT Id FROM Contacts__r) FROM Account];\n"
+        "  }\n"
+        "}\n", encoding="utf-8")
+    result = extract_apex_enhanced(cls)
+    _assert_no_dangling_edges(result)
+    sobjects = {n["id"] for n in result["nodes"] if n.get("file_type") == "sobject"}
+    assert sobject_nid("Account") in sobjects        # root object kept
+    assert not any(s.endswith("__r") for s in sobjects)  # relationship dropped
+
     # --- Apex trigger: SOQL/DML inside a loop ----------------------------
     trig_result = extract_apex_enhanced(FIXTURES / "sf_AccountTrigger.trigger")
 
