@@ -3,12 +3,13 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "graphifyy"
-version = "0.8.40"
-description = "AI coding assistant skill (Claude Code, CodeBuddy, Codex, OpenCode, Kilo Code, Cursor, Gemini CLI, Aider, OpenClaw, Factory Droid, Trae, Hermes, Kiro, Pi, Devin CLI, Google Antigravity) - turn any folder of code, docs, papers, images, or videos into a queryable knowledge graph"
+name = "graphify-sfdx"
+version = "0.1.0"
+description = "Salesforce-aware knowledge graph: parse SFDX metadata (Apex, Flow, LWC, CPQ, Governor Limits, Order-of-Execution) into a queryable NetworkX graph — fully offline, no org connection required."
 readme = "README.md"
 license = { file = "LICENSE" }
-keywords = ["claude", "claude-code", "codex", "opencode", "kilo", "cursor", "gemini", "aider", "kiro", "pi", "devin", "knowledge-graph", "rag", "graphrag", "obsidian", "community-detection", "tree-sitter", "leiden", "llm"]
+authors = [{ name = "JeremyKo95", email = "sukun9512@gmail.com" }]
+keywords = ["salesforce", "sfdx", "apex", "flow", "lwc", "cpq", "governor-limits", "knowledge-graph", "rag", "graphrag", "community-detection", "tree-sitter", "leiden", "mcp"]
 requires-python = ">=3.10"
 dependencies = [
     "networkx>=3.4",
@@ -43,9 +44,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/safishamsi/graphify"
-Repository = "https://github.com/safishamsi/graphify"
-Issues = "https://github.com/safishamsi/graphify/issues"
+Homepage = "https://github.com/JeremyKo95/graphify-sf"
+Repository = "https://github.com/JeremyKo95/graphify-sf"
+Issues = "https://github.com/JeremyKo95/graphify-sf/issues"
 
 [project.optional-dependencies]
 mcp = ["mcp"]
@@ -77,6 +78,9 @@ all = ["mcp", "neo4j", "falkordb", "pypdf", "markdownify", "watchdog", "graspolo
 [project.scripts]
 graphify = "graphify.__main__:main"
 graphify-mcp = "graphify.serve:_main"
+# Collision-safe aliases (in case upstream `graphifyy` is also installed on PATH)
+graphify-sfdx = "graphify.__main__:main"
+graphify-sfdx-mcp = "graphify.serve:_main"
 
 [dependency-groups]
 dev = [
@@ -99,12 +103,14 @@ dev = [
 ]
 
 [tool.uv]
-# Install via: uv tool install graphifyy
-# Run without installing: uvx graphifyy install
+# Install via: uv tool install graphify-sfdx
+# Run without installing: uvx --from graphify-sfdx graphify sf --help
 package = true
 
 [tool.setuptools]
-packages = ["graphify"]
+# graphify.salesforce MUST be listed explicitly — the previous ["graphify"] omitted
+# the entire SF subpackage from the wheel, shipping a graph lib with no SF support.
+packages = ["graphify", "graphify.salesforce"]
 include-package-data = false
 
 [tool.setuptools.package-data]
