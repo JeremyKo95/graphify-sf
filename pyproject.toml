@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphify-sfdx"
-version = "0.1.0"
+version = "0.1.1"
 description = "Salesforce-aware knowledge graph: parse SFDX metadata (Apex, Flow, LWC, CPQ, Governor Limits, Order-of-Execution) into a queryable NetworkX graph — fully offline, no org connection required."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -76,10 +76,9 @@ terraform = ["tree-sitter-hcl"]
 all = ["mcp", "neo4j", "falkordb", "pypdf", "markdownify", "watchdog", "graspologic; python_version < '3.13'", "python-docx", "openpyxl", "faster-whisper; python_version >= '3.11'", "yt-dlp", "matplotlib", "numpy>=2.0; python_version >= '3.13'", "openai", "tiktoken", "boto3", "anthropic", "tree-sitter-sql", "jieba", "tree-sitter-dm", "tree-sitter-hcl"]
 
 [project.scripts]
-graphify = "graphify.__main__:main"
-graphify-mcp = "graphify.serve:_main"
-# Collision-safe aliases (in case upstream `graphifyy` is also installed on PATH)
-graphify-sfdx = "graphify.__main__:main"
+# SF CLI: graphify-sfdx <extract|impact|violations|cpq-chain|ooe|viz|serve|...>
+graphify-sfdx = "graphify.salesforce.cli:main"
+# MCP server over a built graph.json: graphify-sfdx-mcp /abs/path/to/graph.json
 graphify-sfdx-mcp = "graphify.serve:_main"
 
 [dependency-groups]

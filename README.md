@@ -48,32 +48,49 @@ what is certain vs. heuristic. See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.
 
 ## Install
 
+Published on PyPI as **[`graphify-sfdx`](https://pypi.org/project/graphify-sfdx/)**:
+
 ```bash
-pip install -e .
+pip install graphify-sfdx           # into the current environment
+pipx install graphify-sfdx          # isolated CLI on PATH
+uv tool install graphify-sfdx       # same, via uv
 ```
 
-Requires Python 3.11+. `networkx` is required; `graspologic` (Leiden), `mcp` (serve),
-and `tree-sitter` are optional and degrade gracefully when absent.
+Run it without installing anything:
+
+```bash
+uvx --from graphify-sfdx graphify-sfdx --help
+```
+
+Two console scripts are provided: **`graphify-sfdx`** (the SF CLI) and
+**`graphify-sfdx-mcp`** (the MCP server). Requires Python 3.10+. `networkx` is
+required; `mcp` (serve), `graspologic` (Leiden), and `tree-sitter` are optional and
+degrade gracefully when absent. For local development, `pip install -e .` from a clone
+still works.
 
 ## Quick start
 
 ```bash
 # 1. Extract + enrich a graph (optionally merge CPQ rule data)
-python -m graphify.salesforce extract path/to/sf-repo \
+graphify-sfdx extract path/to/sf-repo \
   --output-dir graphify-out --cpq-data path/to/cpq-records
 
 # 2. Ask SF-aware questions (token-bounded)
-python -m graphify.salesforce impact <node-id> --direction downstream
-python -m graphify.salesforce violations --severity HIGH
-python -m graphify.salesforce cpq-chain SBQQ__Quote__c
-python -m graphify.salesforce ooe Opportunity
+graphify-sfdx impact <node-id> --direction downstream
+graphify-sfdx violations --severity HIGH
+graphify-sfdx cpq-chain SBQQ__Quote__c
+graphify-sfdx ooe Opportunity
 
 # 3. Visualize a focused subgraph (self-contained HTML)
-python -m graphify.salesforce viz graphify-out/graph.json --focus <node-id>
+graphify-sfdx viz graphify-out/graph.json --focus <node-id>
 
 # 4. Serve over MCP for an LLM client
-python -m graphify.serve graphify-out/graph.json
+graphify-sfdx-mcp graphify-out/graph.json
 ```
+
+> Every `graphify-sfdx <cmd>` is equivalent to `python -m graphify.salesforce <cmd>`,
+> and `graphify-sfdx-mcp` to `python -m graphify.serve` — use whichever your setup
+> prefers.
 
 Run the test suite with `pytest tests/test_salesforce.py -v`.
 
@@ -86,7 +103,7 @@ flow is always: **extract once → expose the graph → the agent queries it.**
 ### Step 1 — build the graph (once per org snapshot)
 
 ```bash
-python -m graphify.salesforce extract path/to/sf-repo \
+graphify-sfdx extract path/to/sf-repo \
   --output-dir graphify-out --cpq-data path/to/cpq-records
 # → graphify-out/graph.json
 ```
@@ -101,31 +118,46 @@ Serve the graph over MCP; the agent gets token-bounded Salesforce tools
 
 ```bash
 # stdio transport (default — what desktop agents launch)
-python -m graphify.serve graphify-out/graph.json
-# or the console script after `pip install -e .`
-graphify-mcp graphify-out/graph.json
+graphify-sfdx-mcp graphify-out/graph.json
 # shared HTTP transport (team / remote)
-python -m graphify.serve graphify-out/graph.json --transport http --port 8080
+graphify-sfdx-mcp graphify-out/graph.json --transport http --port 8080
 ```
 
-**Claude Code** — one command (use an absolute path to `graph.json`):
+**MCP is a standard protocol, so this one server works with every MCP client** —
+Claude, Codex, Cursor, Copilot, Windsurf, … all launch the same `graphify-sfdx-mcp`
+command. Only the config file location and format differ. Use an **absolute path** to
+`graph.json`. If `graphify-sfdx` isn't installed on PATH, swap the command for
+`uvx` + `--from graphify-sfdx` (shown below) — no clone, no install step.
+
+**Claude Code** — one command:
 
 ```bash
-claude mcp add graphify-sf -- python -m graphify.serve /abs/path/to/graphify-out/graph.json
+# installed on PATH
+claude mcp add graphify-sfdx -- graphify-sfdx-mcp /abs/path/to/graphify-out/graph.json
+# or zero-install via uvx
+claude mcp add graphify-sfdx -- uvx --from graphify-sfdx graphify-sfdx-mcp /abs/path/to/graphify-out/graph.json
 ```
 
-**Claude Desktop / Cursor / Windsurf** — add to the MCP config
+**Claude Desktop / Cursor / Windsurf** — JSON config with an `mcpServers` key
 (`claude_desktop_config.json`, `.cursor/mcp.json`, …); they share this shape:
 
 ```json
 {
   "mcpServers": {
-    "graphify-sf": {
-      "command": "python",
-      "args": ["-m", "graphify.serve", "/abs/path/to/graphify-out/graph.json"]
+    "graphify-sfdx": {
+      "command": "uvx",
+      "args": ["--from", "graphify-sfdx", "graphify-sfdx-mcp", "/abs/path/to/graphify-out/graph.json"]
     }
   }
 }
+```
+
+**OpenAI Codex CLI** — TOML config at `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.graphify-sfdx]
+command = "uvx"
+args = ["--from", "graphify-sfdx", "graphify-sfdx-mcp", "/abs/path/to/graphify-out/graph.json"]
 ```
 
 **VS Code / GitHub Copilot** — `.vscode/mcp.json` uses the `servers` key:
@@ -133,16 +165,19 @@ claude mcp add graphify-sf -- python -m graphify.serve /abs/path/to/graphify-out
 ```json
 {
   "servers": {
-    "graphify-sf": {
+    "graphify-sfdx": {
       "type": "stdio",
-      "command": "python",
-      "args": ["-m", "graphify.serve", "/abs/path/to/graphify-out/graph.json"]
+      "command": "uvx",
+      "args": ["--from", "graphify-sfdx", "graphify-sfdx-mcp", "/abs/path/to/graphify-out/graph.json"]
     }
   }
 }
 ```
 
-Then just ask, e.g. *"What breaks if I change `Opportunity.Amount`? Use graphify-sf."*
+> In any of these, replace the `uvx --from graphify-sfdx graphify-sfdx-mcp` command
+> with a bare `graphify-sfdx-mcp` if you installed the package on PATH.
+
+Then just ask, e.g. *"What breaks if I change `Opportunity.Amount`? Use graphify-sfdx."*
 
 ### Option B — no MCP (CLI the agent shells out to)
 
@@ -150,10 +185,10 @@ For agents that run shell commands but have no MCP, point them at the CLI — ea
 command prints a token-bounded answer to stdout:
 
 ```bash
-python -m graphify.salesforce impact <node-id> --direction downstream
-python -m graphify.salesforce violations --severity HIGH
-python -m graphify.salesforce cpq-chain SBQQ__Quote__c
-python -m graphify.salesforce ooe Opportunity
+graphify-sfdx impact <node-id> --direction downstream
+graphify-sfdx violations --severity HIGH
+graphify-sfdx cpq-chain SBQQ__Quote__c
+graphify-sfdx ooe Opportunity
 ```
 
 ### Tell the agent to use it on every task
@@ -166,11 +201,11 @@ Code), `.github/copilot-instructions.md` (Copilot), `.cursorrules` (Cursor), or
 ## Salesforce knowledge graph
 Before answering Salesforce impact / CPQ / Order-of-Execution / Governor-Limit
 questions, consult the graphify-sf graph instead of reading raw metadata:
-- If the `graphify-sf` MCP server is connected, call `sf_impact` / `sf_violations` /
+- If the `graphify-sfdx` MCP server is connected, call `sf_impact` / `sf_violations` /
   `sf_cpq_chain` / `sf_ooe`.
-- Otherwise run `python -m graphify.salesforce <impact|violations|cpq-chain|ooe> …`.
-Rebuild it with `python -m graphify.salesforce extract <repo> --cpq-data <dir>`
-after pulling fresh metadata.
+- Otherwise run `graphify-sfdx <impact|violations|cpq-chain|ooe> …`.
+Rebuild it with `graphify-sfdx extract <repo> --cpq-data <dir>` after pulling fresh
+metadata.
 ```
 
 ## Coverage
