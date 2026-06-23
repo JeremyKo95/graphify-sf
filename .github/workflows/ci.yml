@@ -75,8 +75,8 @@ jobs:
 
       - name: Verify install works end-to-end
         run: |
-          uv run --frozen graphify --help
-          uv run --frozen graphify install
+          uv run --frozen graphify-sfdx --help
+          uv run --frozen graphify-sfdx-mcp --help
 
   security-scan:
     # The dev deps already include bandit, pip-audit, and safety. Run them in
