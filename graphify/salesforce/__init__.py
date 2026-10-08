@@ -133,6 +133,16 @@ def _parser_for(path: Path):
     return None
 
 
+#: Profile / Permission Set / PSG metadata. Off by default: on a real org their
+#: grants_access_to edges are ~80% of all edges (160k of 195k) and drown the
+#: code/data structure; opt in with ``include_permissions=True``.
+_PERMISSION_SUFFIXES = (
+    ".profile-meta.xml",
+    ".permissionset-meta.xml",
+    ".permissionsetgroup-meta.xml",
+)
+
+
 def _merge_into(all_nodes, node_by_id, node):
     """Merge ``node`` into the accumulated node list, deduping by ``id``.
 
@@ -193,6 +203,31 @@ def _resolve_unqualified_fields(all_nodes, all_edges):
     all_nodes[:] = [n for n in all_nodes if n["id"] not in rewired]
 
 
+def _relativize_paths(all_nodes, all_edges, base: Path):
+    """Rewrite ``source_file`` values under *base* as repo-relative POSIX paths.
+
+    The graph is shared and committed; an absolute path leaks the extracting
+    machine's layout and makes two checkouts of the same repo diff everywhere.
+    Values outside *base* (e.g. the ``cpq_data`` marker) are left as they are.
+    """
+    base = base.resolve()
+    cache: dict[str, str] = {}
+
+    def rel(value):
+        if not isinstance(value, str) or not value:
+            return value
+        if value not in cache:
+            try:
+                cache[value] = Path(value).resolve().relative_to(base).as_posix()
+            except ValueError:
+                cache[value] = value
+        return cache[value]
+
+    for item in (*all_nodes, *all_edges):
+        if "source_file" in item:
+            item["source_file"] = rel(item["source_file"])
+
+
 def _drop_transient_attrs(all_nodes):
     """Remove ``_``-prefixed working attributes (e.g. Apex ``_source``).
 
@@ -235,7 +270,7 @@ def _merge_lwc_components(all_nodes, all_edges):
         node_by_id.pop(html_id, None)
 
 
-def extract_sf(path, *, cpq_data_dir=None, **kwargs):
+def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
     """Extract a Salesforce repository into a knowledge graph.
 
     Dispatches every supported Salesforce file under ``path`` to its parser,
@@ -255,6 +290,7 @@ def extract_sf(path, *, cpq_data_dir=None, **kwargs):
         6. ``permission_analysis_pass`` — Profile/FLS constraints on CPQ
            (``gov_permission_violation`` edges, ADR-028). Runs after CPQ so
            ``file_type == "cpq_rule"`` / ``sf_cpq_object`` are already set.
+           Only yields edges with ``include_permissions=True``.
         7. ``detect_flow_cpq_loops``   — Flow ↔ CPQ Type A loops
            (``infinite_loop_risk`` self-edges, ADR-029).
         8. ``validation_cpq_analysis_pass`` — CPQ Rule ↔ Validation Rule field
@@ -270,10 +306,14 @@ def extract_sf(path, *, cpq_data_dir=None, **kwargs):
             (Price/Product Rules, Conditions, Actions). When given, the real CPQ
             rule logic is merged in before the analysis passes so ``validation_cpq``
             / impact see the fields rules actually read/write (Phase 2).
+        include_permissions: Also parse Profiles / Permission Sets / Permission
+            Set Groups (``grants_access_to`` / ``contains_permission_set`` edges
+            and the FLS input of ``permission_analysis_pass``). Off by default.
         **kwargs: Reserved for future options (neo4j-uri, …); currently ignored.
 
     Returns:
-        ``{"nodes": [...], "edges": [...]}`` — the merged, analyzed graph.
+        ``{"nodes": [...], "edges": [...]}`` — the merged, analyzed graph, with
+        ``source_file`` values relative to *path* (its parent for a single file).
     """
     from .cpq import cpq_analysis_pass
     from .flow_cpq_loops import detect_flow_cpq_loops
@@ -297,6 +337,8 @@ def extract_sf(path, *, cpq_data_dir=None, **kwargs):
     node_by_id: dict[str, dict] = {}
 
     for file_path in files:
+        if not include_permissions and file_path.name.endswith(_PERMISSION_SUFFIXES):
+            continue
         parser = _parser_for(file_path)
         if parser is None:
             continue
@@ -334,4 +376,5 @@ def extract_sf(path, *, cpq_data_dir=None, **kwargs):
     all_edges.extend(validation_cpq_analysis_pass(all_nodes, all_edges))
 
     _drop_transient_attrs(all_nodes)
+    _relativize_paths(all_nodes, all_edges, root.parent if root.is_file() else root)
     return {"nodes": all_nodes, "edges": all_edges}

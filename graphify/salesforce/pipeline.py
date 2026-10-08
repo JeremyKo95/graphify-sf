@@ -85,5 +85,21 @@ def write_sf_graph(G: nx.DiGraph, out_path: Path | str) -> Path:
         data = json_graph.node_link_data(G, edges="links")
     except TypeError:  # NetworkX < 3.4 has no ``edges`` kwarg
         data = json_graph.node_link_data(G)
-    out_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    # Compact separators: indentation alone was ~25% of a real org's file.
+    out_path.write_text(
+        json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+    )
     return out_path
+
+
+def write_sf_summary(G: nx.DiGraph, out_path: Path | str) -> dict:
+    """Write ``quality.graph_summary(G)`` as pretty JSON and return it."""
+    from graphify.salesforce.quality import graph_summary
+
+    summary = graph_summary(G)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    return summary

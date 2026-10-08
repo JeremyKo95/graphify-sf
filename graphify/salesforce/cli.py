@@ -2,7 +2,8 @@
 graphify-sf: ``graphify sf`` command-line interface.
 
 Subcommands:
-    extract <path> [--output-dir] [--cpq-data]   build + enrich an SF graph.json
+    extract <path> [--output-dir] [--cpq-data] [--include-permissions]
+                                                 build + enrich graph.json + summary.json
     serve <graph.json>                           run the base MCP server
     impact <node> [--direction] [--depth]        impact traversal
     violations [--severity]                       diagnostic risks
@@ -42,17 +43,28 @@ def _load_graph(path: Path) -> nx.DiGraph:
 
 def _cmd_extract(args: argparse.Namespace) -> int:
     from graphify.salesforce import extract_sf
-    from graphify.salesforce.pipeline import build_sf_graph, write_sf_graph
+    from graphify.salesforce.pipeline import (
+        build_sf_graph,
+        write_sf_graph,
+        write_sf_summary,
+    )
+    from graphify.salesforce.quality import integrity_errors
 
     out_dir = Path(args.output_dir)
     print(f"🚀 Extracting {args.path}")
-    extraction = extract_sf(args.path, cpq_data_dir=args.cpq_data)
+    extraction = extract_sf(args.path, cpq_data_dir=args.cpq_data,
+                            include_permissions=args.include_permissions)
     G = build_sf_graph(extraction)
     graph_file = write_sf_graph(G, out_dir / "graph.json")
+    summary = write_sf_summary(G, out_dir / "summary.json")
 
     communities = {d.get("community") for _, d in G.nodes(data=True) if d.get("community") is not None}
     print(f"✅ nodes={G.number_of_nodes()} edges={G.number_of_edges()} communities={len(communities)}")
     print(f"💾 {graph_file}")
+    print(f"💾 {out_dir / 'summary.json'}")
+    errors = integrity_errors(summary)
+    if errors:
+        print(f"⚠️  integrity: {', '.join(errors)}", file=sys.stderr)
     return 0
 
 
@@ -124,10 +136,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="graphify sf", description="Salesforce knowledge-graph CLI")
     sub = p.add_subparsers(dest="command", required=True)
 
-    pe = sub.add_parser("extract", help="build + enrich an SF graph.json")
+    pe = sub.add_parser("extract", help="build + enrich an SF graph.json (+ summary.json)")
     pe.add_argument("path")
     pe.add_argument("--output-dir", default="graphify-out")
     pe.add_argument("--cpq-data", default=None, help="dir of SFDX JSON SBQQ data exports")
+    pe.add_argument("--include-permissions", action="store_true",
+                    help="also parse Profiles / Permission Sets / PSGs (grants_access_to edges)")
     pe.set_defaults(func=_cmd_extract)
 
     ps = sub.add_parser("serve", help="run the base MCP server on a graph.json")

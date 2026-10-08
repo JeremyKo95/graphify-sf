@@ -2004,9 +2004,9 @@ class TestExtractSF:
             - flows/     3 Flow files
             - objects/   2 Custom Object files
             - lwc/       1 LWC component pair (html + js)
-            - profiles/  1 Profile
+            - profiles/  1 Profile (parsed with include_permissions=True)
         """
-        result = extract_sf(SAMPLE_ORG)
+        result = extract_sf(SAMPLE_ORG, include_permissions=True)
 
         # 1. No top-level error.
         assert "error" not in result
@@ -2089,6 +2089,36 @@ class TestExtractSF:
         assert "error" not in result
         node_ids = {n["id"] for n in result["nodes"]}
         assert sobject_nid("Account") in node_ids
+
+
+    def test_permissions_are_opt_in(self) -> None:
+        """Profiles / Permission Sets are skipped unless include_permissions=True."""
+        default = extract_sf(SAMPLE_ORG)
+        assert not any(n["file_type"] == "profile" for n in default["nodes"])
+        assert not any(e["relation"] == "grants_access_to" for e in default["edges"])
+        opted_in = extract_sf(SAMPLE_ORG, include_permissions=True)
+        assert any(e["relation"] == "grants_access_to" for e in opted_in["edges"])
+
+    def test_source_files_are_repo_relative(self) -> None:
+        result = extract_sf(SAMPLE_ORG)
+        files = {n["source_file"] for n in result["nodes"]} | {
+            e["source_file"] for e in result["edges"] if "source_file" in e}
+        assert "classes/AccountService.cls" in files
+        assert not any(f.startswith("/") for f in files if f)
+
+    def test_written_graph_is_compact_with_clean_summary(self, tmp_path) -> None:
+        """graph.json is unindented; summary.json reports zero integrity defects."""
+        from graphify.salesforce.pipeline import write_sf_summary
+        from graphify.salesforce.quality import integrity_errors
+
+        G = build_sf_graph(extract_sf(SAMPLE_ORG, include_permissions=True))
+        text = write_sf_graph(G, tmp_path / "graph.json").read_text(encoding="utf-8")
+        assert "\n" not in text and ": " not in text[:200]
+        summary = write_sf_summary(G, tmp_path / "summary.json")
+        assert json.loads((tmp_path / "summary.json").read_text()) == summary
+        assert summary["nodes"] == G.number_of_nodes()
+        assert summary["nodes_by_type"]["sobject"] >= 2
+        assert integrity_errors(summary) == []
 
 
 class TestBackwardsCompatibility:
