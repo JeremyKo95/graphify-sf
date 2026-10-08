@@ -71,6 +71,7 @@ def _cmd_extract(args: argparse.Namespace) -> int:
     errors = integrity_errors(summary)
     if errors:
         print(f"⚠️  integrity: {', '.join(errors)}", file=sys.stderr)
+        return 1 if args.strict else 0
     return 0
 
 
@@ -148,6 +149,8 @@ def _build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--cpq-data", default=None, help="dir of SFDX JSON SBQQ data exports")
     pe.add_argument("--include-permissions", action="store_true",
                     help="also parse Profiles / Permission Sets / PSGs (grants_access_to edges)")
+    pe.add_argument("--strict", action="store_true",
+                    help="exit 1 when summary.json reports an integrity error")
     pe.set_defaults(func=_cmd_extract)
 
     ps = sub.add_parser("serve", help="run the base MCP server on a graph.json")

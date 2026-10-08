@@ -148,6 +148,10 @@ def validate_sf_graph(G: nx.DiGraph) -> list[str]:
         2. The ``order_of_execution`` subgraph is acyclic (must be a DAG).
         3. ``cpq_applies_to`` edges carry the required ``execution_order`` attr.
         4. ``governor_violation`` edges carry the required diagnostic attrs.
+        5. Ontology integrity (``quality.graph_summary``): repo-relative paths,
+           no source text on nodes, one owning object per field, Apex labels
+           equal to their file names, ``cpq_rule`` only from CPQ rule data, and
+           ``sf_qualified_name`` on every mappable node.
 
     Args:
         G: Assembled NetworkX directed graph.
@@ -191,5 +195,10 @@ def validate_sf_graph(G: nx.DiGraph) -> list[str]:
                 errors.append(
                     f"{relation} edge missing required '{attr}': {u} -> {v}"
                 )
+
+    # Check 5: ontology integrity counters
+    from graphify.salesforce.quality import graph_summary, integrity_errors
+
+    errors.extend(f"Integrity: {e}" for e in integrity_errors(graph_summary(G)))
 
     return errors

@@ -2197,6 +2197,27 @@ class TestExtractSF:
         assert integrity_errors(summary) == []
 
 
+    def test_validate_sf_graph_gate(self) -> None:
+        """A clean extraction validates; each ontology-integrity defect is reported."""
+        from graphify.salesforce.validate_sf import validate_sf_graph
+
+        G = build_sf_graph(extract_sf(SAMPLE_ORG, include_permissions=True))
+        assert validate_sf_graph(G) == []
+
+        G.add_node("apex_leak", label="for", file_type="code", sf_code_type="class",
+                   source_file="/Users/x/classes/Leak.cls", source="public class Leak {}")
+        G.add_node(field_nid("Account", "Dup__c"), label="Account.Dup__c", file_type="field")
+        G.add_edge(field_nid("Account", "Dup__c"), sobject_nid("Account"),
+                   key="field_of", relation="field_of")
+        G.add_edge(field_nid("Account", "Dup__c"), sobject_nid("Opportunity"),
+                   key="field_of", relation="field_of")
+        errors = " ".join(validate_sf_graph(G))
+        for key in ("absolute_source_files", "nodes_with_source_text",
+                    "fields_with_multiple_objects", "apex_label_mismatches",
+                    "nodes_missing_qualified_name"):
+            assert key in errors, key
+
+
 class TestBackwardsCompatibility:
     """Existing language support must keep working alongside the SF parsers."""
 

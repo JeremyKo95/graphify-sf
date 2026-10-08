@@ -24,6 +24,12 @@ _INTEGRITY_KEYS = (
     "fields_with_multiple_objects",
     "apex_label_mismatches",
     "cpq_rules_without_rule_data",
+    "nodes_missing_qualified_name",
+)
+
+#: Node types an ontology maps onto; each must carry ``sf_qualified_name``.
+_QUALIFIED_TYPES = frozenset(
+    {"sobject", "field", "flow", "lwc_component", "validation_rule"}
 )
 
 
@@ -63,6 +69,15 @@ def graph_summary(G: nx.Graph) -> dict:
         "cpq_rules_without_rule_data": sum(
             1 for d in nodes.values()
             if d.get("file_type") == "cpq_rule" and d.get("source_file") != "cpq_data"
+        ),
+        "nodes_missing_qualified_name": sum(
+            1 for d in nodes.values()
+            if not d.get("sf_qualified_name")
+            and (
+                d.get("file_type") in _QUALIFIED_TYPES
+                or d.get("sf_code_type") in ("class", "trigger", "interface", "enum")
+                or d.get("sf_method_type") == "method"
+            )
         ),
     }
 
