@@ -7,7 +7,7 @@
 > for Apex, Flow, LWC, CPQ data, and the realities of Governor Limits.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](#)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](#)
 
 ---
 
@@ -25,10 +25,17 @@ consumption → onboarding, analysis, impact review, and development.**
 
 ## Capabilities
 
-- **Parsers** (`graphify/salesforce/`): Apex (regex, ADR-019), Flow (typed record
-  tags), LWC (`@wire` + imperative Apex), Custom Object/Field, Profile/Permission Set,
-  Validation Rule, Record Type, Permission Set Group, Workflow, **Custom Metadata
-  records, Sharing Rules, Custom Labels, Custom Settings**.
+- **Parsers** (`graphify/salesforce/`): Apex classes & triggers, Flow (typed record
+  tags), LWC (`@wire` + imperative Apex), Aura bundles, Custom Object/Field,
+  Validation Rule, Record Type, Workflow, Custom Metadata records, Sharing Rules,
+  Custom Labels, Custom Settings, **Lightning pages (FlexiPage) and Experience Cloud
+  views**, and — opt-in — Profile / Permission Set / Permission Set Group.
+- **Field-level lineage**: which Apex, Flow, formula field, Validation Rule or page
+  **reads** or **writes** each field (`reads_field` / `writes_field`), through
+  relationship paths (`Account.Owner.Email` → `User.Email`) and child subqueries;
+  lookups as `lookup_to`.
+- **UI placement**: which FlexiPage / Experience page `hosts` each LWC or Aura
+  component, so upstream impact reaches the screen.
 - **CPQ rule data ingest** (`cpq_data.py`): SBQQ Price/Product Rules, Conditions,
   Actions from **SFDX JSON or Gearset `*.gs.json`**, plus **JavaScript QCP** custom
   scripts — the logic that lives as data records, not metadata.
@@ -38,13 +45,16 @@ consumption → onboarding, analysis, impact review, and development.**
 - **Analysis passes** (whole-graph): Order of Execution, Governor Limits, recursive
   triggers, Profile/FLS permission impact, Flow↔CPQ infinite loops, CPQ↔Validation
   Rule conflicts.
-- **Token-minimized consumption** (`pipeline.py`/`query.py`/`cli.py`/`viz.py`): Leiden
-  community clustering, `token_budget`-bounded queries, an MCP server, and a focused
-  self-contained HTML visualization.
+- **Token-minimized consumption** (`pipeline.py`/`query.py`/`cli.py`/`viz.py`):
+  deterministic community clustering, `token_budget`-bounded queries, an MCP server,
+  and a focused self-contained HTML visualization.
+- **A stable base for ontologies and diffs**: API-name-based node IDs, a
+  byte-identical `graph.json` for the same input, a small `summary.json` with
+  integrity counters, and no source code inside the graph. See
+  [Graph model](#graph-model).
 
-Every node/edge carries a `confidence` (EXTRACTED / INFERRED / AMBIGUOUS) so you know
-what is certain vs. heuristic. See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md),
-[`docs/ADR.md`](./docs/ADR.md), and [`docs/PRD.md`](./docs/PRD.md).
+Every edge carries a `confidence` (EXTRACTED / INFERRED / AMBIGUOUS) so you know
+what is certain vs. heuristic.
 
 ## Install
 
@@ -63,10 +73,11 @@ uvx --from graphify-sfdx graphify-sfdx --help
 ```
 
 Two console scripts are provided: **`graphify-sfdx`** (the SF CLI) and
-**`graphify-sfdx-mcp`** (the MCP server). Requires Python 3.10+. `networkx` is
-required; `mcp` (serve), `graspologic` (Leiden), and `tree-sitter` are optional and
-degrade gracefully when absent. For local development, `pip install -e .` from a clone
-still works.
+**`graphify-sfdx-mcp`** (the MCP server). Requires Python 3.10+. The Salesforce
+extractor itself only uses `networkx`; the package currently still installs the
+upstream graphify dependency set (tree-sitter grammars for other languages). Extras:
+`graphify-sfdx[mcp]` for the MCP server, `graphify-sfdx[neo4j]` for live Neo4j push.
+For local development, `pip install -e .` from a clone still works.
 
 ## Quick start
 
@@ -74,6 +85,10 @@ still works.
 # 1. Extract + enrich a graph (optionally merge CPQ rule data)
 graphify-sfdx extract path/to/sf-repo \
   --output-dir graphify-out --cpq-data path/to/cpq-records
+#    -> graphify-out/graph.json    (full graph, deterministic)
+#    -> graphify-out/summary.json  (counts + integrity report, a few KB)
+#    --include-permissions  also parse Profiles / Permission Sets / PSGs
+#    --strict               exit 1 if summary.json reports an integrity error
 
 # 2. Ask SF-aware questions (token-bounded)
 graphify-sfdx impact <node-id> --direction downstream
@@ -208,17 +223,69 @@ Rebuild it with `graphify-sfdx extract <repo> --cpq-data <dir>` after pulling fr
 metadata.
 ```
 
+## Graph model
+
+What downstream consumers (an ontology mapping, a daily diff, an agent) can rely on.
+
+**Node IDs** are derived from Salesforce API names, never from display labels or
+parse order, so a mapping that points at an ID keeps pointing at the same thing:
+
+| Node (`file_type`) | ID | `sf_qualified_name` / label |
+|---|---|---|
+| SObject (`sobject`) | `sobject_account` | `Account` |
+| Field (`field`) | `field_account.region__c` | `Account.Region__c` |
+| Apex class / trigger (`code`) | `apex_accountservice` | `AccountService` |
+| Apex method (`code`) | `apex_accountservice.getaccounts` | `AccountService.getAccounts` |
+| Flow (`flow`) | `flow_<name>` | Flow API name |
+| LWC / Aura (`lwc_component` / `aura_component`) | `lwc_<bundle>` / `aura_<bundle>` | bundle folder name |
+| Validation Rule (`validation_rule`) | `validation_account.need_region` | `Account.Need_Region` |
+| FlexiPage / Experience view | `flexipage_<name>` / `experience_<site>.<view>` | `<name>` / `<site>/<view>` |
+
+IDs are lower-cased; `sf_qualified_name` keeps the original casing and is the
+recommended join key. Display labels live in `sf_label`.
+
+**Main relations**
+
+| Relation | From → To |
+|---|---|
+| `field_of`, `lookup_to` | field → its object, lookup field → referenced object |
+| `reads_field`, `writes_field` | Apex / Flow / formula field / Validation Rule / page → field |
+| `queries`, `dml_operates_on` | Apex / Flow → SObject (`sf_dynamic` for string-built SOQL) |
+| `triggers_on` | Apex trigger / record-triggered Flow → SObject |
+| `member_of` | Apex method → class |
+| `wire_to`, `lwc_calls`, `aura_controller`, `flow_invokes` | UI / Flow → Apex |
+| `hosts`, `page_for` | page → component, record page → SObject |
+| `cpq_*`, `maps_to`, `validates`, `order_of_execution`, diagnostics | CPQ rules, `__mdt` mappings, analysis passes |
+
+**Guarantees**
+
+- The graph is a directed multigraph keyed by relation: a class that both reads
+  and updates `Account` keeps both edges; repeated sites fold into one edge with
+  `sf_occurrences` and `source_locations`.
+- Same input → byte-identical `graph.json` (sorted output, deterministic clustering).
+- `source_file` is relative to the extracted path; no source code is stored
+  (Apex nodes keep `sf_loc` and `sf_source_hash`).
+- `sf_stub: true` marks something referenced but not defined in the repo (standard
+  objects/fields, managed classes); `sf_unresolved` marks a field reference whose
+  object could not be determined.
+- `summary.json` reports node/edge counts plus integrity counters that must stay 0;
+  `--strict` turns a non-zero counter into a failing exit code.
+
 ## Coverage
 
 | Area | Module | Status |
 |---|---|---|
-| Core parsers (Apex/Flow/LWC/Objects/Profiles) | `apex_enhanced`, `flow`, `lwc`, `objects`, `profiles` | ✅ |
-| Metadata coverage (RecordType/PSG/Workflow/Custom Metadata/Sharing/Label/Setting) | `metadata`, `objects` | ✅ |
+| Core parsers (Apex/Flow/LWC/Aura/Objects) | `apex_enhanced`, `flow`, `lwc`, `pages`, `objects` | ✅ |
+| Field-level reads / writes (Apex, Flow, formulas, Validation Rules, pages) | `field_refs` + parsers | ✅ |
+| UI placement (FlexiPage, Experience Cloud views) | `pages` | ✅ |
+| Metadata coverage (RecordType/Workflow/Custom Metadata/Sharing/Label/Setting) | `metadata`, `objects` | ✅ |
+| Permissions (Profile/Permission Set/PSG) — opt-in | `profiles`, `metadata` | ✅ |
 | CPQ rule data (SFDX + Gearset + JS QCP) | `cpq_data` | ✅ |
 | `__mdt` field mapping (Opp→Quote) | `mdt_mapping` | ✅ |
 | Token-minimized consumption (cluster/query/CLI/viz/MCP) | `pipeline`, `query`, `cli`, `viz` | ✅ |
+| Integrity report (`summary.json`, `--strict`) | `quality`, `validate_sf` | ✅ |
 | Neo4j export | `neo4j_sf` | ✅ |
-| Apex cross-class call resolution | tree-sitter promotion | ⏸ deferred (ADR-019) |
+| Apex cross-class call resolution | symbol table needed | ⏸ deferred |
 
 ---
 
