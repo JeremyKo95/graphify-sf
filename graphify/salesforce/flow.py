@@ -33,10 +33,12 @@ mode). Unknown element types are ignored silently (no error) — Flow logic
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from graphify.salesforce.constants import apex_nid, sobject_stub
+from graphify.salesforce.field_refs import field_ref
 
 #: Salesforce metadata XML namespace.
 _NS = {"md": "http://soap.sforce.com/2006/04/metadata"}
@@ -47,6 +49,11 @@ _DML_TYPE_BY_ELEMENT = {
     "recordUpdates": "UPDATE",
     "recordDeletes": "DELETE",
 }
+
+
+#: ``$Record.Field``, ``Var.Rel__r.Field`` mentions anywhere in the Flow XML
+#: (element references, formulas, ``{!...}`` merge fields).
+_VARIABLE_FIELD_RE = re.compile(r"(?<![\w$.])(\$Record__Prior|\$Record|\w+)\.(\w+(?:\.\w+)?)")
 
 
 def _flow_name(path: Path) -> str:
@@ -141,6 +148,39 @@ def extract_flow(path: Path) -> dict:
         obj_type = var.findtext("md:objectType", namespaces=_NS)
         if var_name and obj_type:
             variables[var_name] = obj_type
+    # A Get Records element that stores its output automatically is itself a
+    # record variable named after the element.
+    for elem in root.findall("md:recordLookups", namespaces=_NS):
+        name = elem.findtext("md:name", namespaces=_NS)
+        obj = elem.findtext("md:object", namespaces=_NS)
+        if name and obj and not elem.findtext("md:outputReference", namespaces=_NS):
+            variables.setdefault(name, obj)
+    if trigger_object:
+        variables["$Record"] = trigger_object
+        variables["$Record__Prior"] = trigger_object
+    field_refs: list[dict] = []
+
+    def _field_ref(object_api: str, field: str, relation: str, elem_name) -> None:
+        field_refs.append(field_ref(
+            flow_id, object_api, field, relation, path,
+            confidence="EXTRACTED", sf_flow_element=elem_name,
+        ))
+
+    def _element_field_refs(elem, object_api: str, write: bool) -> None:
+        """queriedFields / filters are reads; inputAssignments are writes."""
+        name = elem.findtext("md:name", namespaces=_NS)
+        for queried in elem.findall("md:queriedFields", namespaces=_NS):
+            if queried.text and queried.text.strip():
+                _field_ref(object_api, queried.text.strip(), "reads_field", name)
+        for flt in elem.findall("md:filters", namespaces=_NS):
+            field = flt.findtext("md:field", namespaces=_NS)
+            if field:
+                _field_ref(object_api, field, "reads_field", name)
+        if write:
+            for assignment in elem.findall("md:inputAssignments", namespaces=_NS):
+                field = assignment.findtext("md:field", namespaces=_NS)
+                if field:
+                    _field_ref(object_api, field, "writes_field", name)
 
     def _add_sobject_stub(object_api: str) -> str:
         node = sobject_stub(object_api, path)
@@ -154,7 +194,8 @@ def extract_flow(path: Path) -> dict:
             return obj
         ref = elem.findtext("md:inputReference", namespaces=_NS)
         if ref:
-            # inputReference may be "Var" or "Var.field"; resolve the root var.
+            # inputReference may be "Var", "Var.field" or "$Record"; resolve the
+            # root variable (``$Record`` is the triggering record).
             return variables.get(ref.split(".")[0])
         return None
 
@@ -186,6 +227,7 @@ def extract_flow(path: Path) -> dict:
                 "sf_flow_element": elem.findtext("md:name", namespaces=_NS),
             }
         )
+        _element_field_refs(elem, target_object, write=False)
 
     # 2b. recordCreates / recordUpdates / recordDeletes -> dml_operates_on
     for tag, dml_type in _DML_TYPE_BY_ELEMENT.items():
@@ -204,6 +246,22 @@ def extract_flow(path: Path) -> dict:
                     "sf_flow_element": elem.findtext("md:name", namespaces=_NS),
                 }
             )
+            _element_field_refs(elem, target_object, write=dml_type != "DELETE")
+
+    # 2d. Field reads / writes through record variables ($Record, Get Records
+    # outputs, sObject variables). An Assignment to ``var.Field`` is a write;
+    # every other ``var.Field`` / ``var.Rel.Field`` mention is a read.
+    for item in root.iter(f"{{{_NS['md']}}}assignmentItems"):
+        target = item.findtext("md:assignToReference", namespaces=_NS) or ""
+        base, _, field = target.partition(".")
+        if field and "." not in field and base in variables:
+            _field_ref(variables[base], field, "writes_field", None)
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    raw = re.sub(r"<assignToReference>[^<]*</assignToReference>", "", raw)
+    for match in _VARIABLE_FIELD_RE.finditer(raw):
+        base, field_path = match.group(1), match.group(2)
+        if base in variables:
+            _field_ref(variables[base], field_path, "reads_field", None)
 
     # 2c. actionCalls with actionType=apex -> flow_invokes (Flow -> Apex)
     for elem in root.findall("md:actionCalls", namespaces=_NS):
@@ -240,4 +298,4 @@ def extract_flow(path: Path) -> dict:
     # Other elements (decisions, assignments, loops, screens, subflows):
     # intentionally not analyzed — Flow branching logic is out of scope.
 
-    return {"nodes": nodes, "edges": edges}
+    return {"nodes": nodes, "edges": edges, "field_refs": field_refs}

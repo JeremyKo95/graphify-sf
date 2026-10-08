@@ -560,6 +560,38 @@ def test_flow_parser() -> None:
     assert inv["sf_flow_element"] == "Call_Apex"
 
 
+def test_flow_field_reads_and_writes(tmp_path: Path) -> None:
+    """Record-triggered Flow: Get Records / Update / Assignment / $Record mentions."""
+    flow = tmp_path / "flows" / "Tier_Sync.flow-meta.xml"
+    flow.parent.mkdir(parents=True)
+    flow.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Flow xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <start><object>Contact</object><recordTriggerType>Update</recordTriggerType>"
+        "<triggerType>RecordAfterSave</triggerType></start>\n"
+        "  <recordLookups><name>Get_Account</name><object>Account</object>"
+        "<filters><field>Id</field><operator>EqualTo</operator>"
+        "<value><elementReference>$Record.AccountId</elementReference></value></filters>"
+        "<queriedFields>Tier__c</queriedFields></recordLookups>\n"
+        "  <decisions><name>Gold</name><rules><conditions>"
+        "<leftValueReference>Get_Account.Tier__c</leftValueReference>"
+        "</conditions></rules></decisions>\n"
+        "  <assignments><name>Set_Flag</name><assignmentItems>"
+        "<assignToReference>$Record.Is_Gold__c</assignToReference>"
+        "<operator>Assign</operator></assignmentItems></assignments>\n"
+        "  <recordUpdates><name>Update_Account</name><inputReference>Get_Account</inputReference>"
+        "<inputAssignments><field>Last_Sync__c</field></inputAssignments></recordUpdates>\n"
+        "</Flow>\n", encoding="utf-8")
+    result = extract_sf(tmp_path)
+    _assert_no_dangling_edges(result)
+    flow_id = "flow_tier_sync"
+    reads = {t for s, t in _field_edges(result, "reads_field") if s == flow_id}
+    writes = {t for s, t in _field_edges(result, "writes_field") if s == flow_id}
+    assert reads == {field_nid("Account", "Tier__c"), field_nid("Contact", "AccountId")}
+    assert writes == {field_nid("Contact", "Is_Gold__c"), field_nid("Account", "Last_Sync__c")}
+    assert (flow_id, sobject_nid("Contact")) in _field_edges(result, "triggers_on")
+
+
 def test_lwc_parser() -> None:
     # --- HTML template ---------------------------------------------------
     html_result = extract_lwc_html(FIXTURES / "sf_MyComponent.html")
