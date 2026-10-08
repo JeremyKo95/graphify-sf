@@ -359,6 +359,81 @@ def test_apex_soql_relationship_subquery_not_sobject(tmp_path: Path) -> None:
     assert opp_dml[0]["sf_dml_type"] == "UPDATE"
 
 
+def _apex_edges(tmp_path: Path, body: str, relation: str) -> list[dict]:
+    cls = tmp_path / "C.cls"
+    cls.write_text(f"public class C {{\n{body}\n}}\n", encoding="utf-8")
+    return [e for e in extract_apex_enhanced(cls)["edges"] if e["relation"] == relation]
+
+
+def test_soql_multiline_field_list(tmp_path: Path) -> None:
+    """Multi-line SELECT lists are extracted (real org: 628 SOQL sites, 11%, were lost)."""
+    edges = _apex_edges(tmp_path, """
+    public static Account f(Id x) {
+        return [
+            SELECT
+                Name,
+                CLOUD_Current_Year_Total_Miles__c
+            FROM Account
+            WHERE Id = :x LIMIT 1
+        ];
+    }""", "queries")
+    assert [e["target"] for e in edges] == [sobject_nid("Account")]
+    assert edges[0]["confidence"] == "EXTRACTED"
+    assert edges[0]["source_location"] == "L5"  # the SELECT line
+
+
+def test_soql_ignores_comments_and_never_crosses_statements(tmp_path: Path) -> None:
+    edges = _apex_edges(tmp_path, """
+    // List<Lead> l = [SELECT Id FROM Lead];
+    /* [SELECT Id FROM Task] */
+    String s = 'SELECT';
+    List<Case> c = [SELECT Id FROM Case];""", "queries")
+    assert [e["target"] for e in edges] == [sobject_nid("Case")]
+
+
+def test_dynamic_soql_string_is_inferred(tmp_path: Path) -> None:
+    cls = tmp_path / "Dyn.cls"
+    cls.write_text(
+        "public class Dyn {\n"
+        "  public List<SObject> f() { return Database.query('SELECT Id, Name FROM Account LIMIT 5'); }\n"
+        "  public List<SObject> g(String o) { return Database.query('SELECT Id FROM ' + o); }\n"
+        "}\n", encoding="utf-8")
+    result = extract_apex_enhanced(cls)
+    q = [e for e in result["edges"] if e["relation"] == "queries"]
+    assert [e["target"] for e in q] == [sobject_nid("Account")]
+    assert q[0]["confidence"] == "INFERRED" and q[0]["sf_dynamic"] is True
+    assert result["nodes"][0]["sf_dynamic_soql"] is True
+
+
+def test_soql_subquery_does_not_hide_main_object(tmp_path: Path) -> None:
+    edges = _apex_edges(tmp_path, """
+    List<Account> a = [SELECT Id, (SELECT Id FROM Contacts) FROM Account];""", "queries")
+    assert [e["target"] for e in edges] == [sobject_nid("Account")]
+
+
+def test_soql_semi_join_queries_second_object(tmp_path: Path) -> None:
+    edges = _apex_edges(tmp_path, """
+    List<Contact> c = [SELECT Id FROM Contact
+        WHERE Id NOT IN (SELECT ContactId FROM User WHERE IsActive = true)];""", "queries")
+    assert sorted(e["target"] for e in edges) == [sobject_nid("Contact"), sobject_nid("User")]
+
+
+def test_dml_variants(tmp_path: Path) -> None:
+    edges = _apex_edges(tmp_path, """
+    public void f(List<Opportunity> opps) {
+        // update opps;
+        upsert opps;
+        Database.update(opps, false);
+        insert new Task(Subject = 'x');
+    }""", "dml_operates_on")
+    got = [(e["sf_dml_type"], e["target"]) for e in edges]
+    assert got == [
+        ("UPSERT", sobject_nid("Opportunity")),
+        ("UPDATE", sobject_nid("Opportunity")),
+        ("INSERT", sobject_nid("Task")),
+    ]
+
+
 def test_flow_parser() -> None:
     fixture = FIXTURES / "sf_AccountFlow.flow-meta.xml"
     result = extract_flow(fixture)

@@ -11,7 +11,9 @@ first, tree-sitter deferred to Phase 3). It extracts:
       attribute for the CPQ / governor passes; ``extract_sf`` drops it.
     - Method signatures (``member_of`` edge back to the owning class).
     - ``triggers_on`` edge from a trigger to its SObject (with the DML events).
-    - SOQL queries (``queries`` edge -> SObject, ``sf_in_loop`` tagged).
+    - SOQL queries (``queries`` edge -> SObject, ``sf_in_loop`` tagged): inline
+      ``[SELECT ...]`` sites are EXTRACTED; query-shaped string literals (dynamic
+      SOQL) are INFERRED with ``sf_dynamic``.
     - DML operations (``dml_operates_on`` edge -> SObject, ``sf_in_loop`` tagged).
     - ``implements`` of well-known interfaces (QCP, Database.Batchable hint).
 
@@ -65,14 +67,50 @@ _METHOD_RE = re.compile(
     r"(\w+(?:<[^>]+>)?)\s+(\w+)\s*\((.*?)\)"
 )
 
-#: SOQL: ``[SELECT ... FROM <SObject> ...]``. Single-line (no DOTALL).
-_SOQL_RE = re.compile(r"SELECT\s+.*?\s+FROM\s+(\w+)", re.IGNORECASE)
+#: Inline SOQL ``[SELECT ... ]`` on comment/string-stripped code. The bracket
+#: bounds the query, so multi-line field lists are captured and a stray
+#: ``SELECT`` never runs on into the next statement's ``FROM``.
+_INLINE_SOQL_RE = re.compile(r"\[\s*(SELECT\b.*?)\]", re.IGNORECASE | re.DOTALL)
 
-#: DML keyword followed by the target variable: ``update opps``.
-_DML_RE = re.compile(r"\b(insert|update|delete)\s+(\w+)", re.IGNORECASE)
+#: A string literal that is itself a query (dynamic SOQL text).
+_STRING_SOQL_RE = re.compile(r"\bSELECT\b.*\bFROM\s+\w+", re.IGNORECASE | re.DOTALL)
+
+#: Semi-join ``Id [NOT] IN (SELECT AccountId FROM Contact ...)`` — a query on a
+#: second object, not a child relationship.
+_SEMI_JOIN_RE = re.compile(
+    r"\bIN\s*\(\s*(SELECT\b[^()]*?\bFROM\s+\w+[^()]*)\)", re.IGNORECASE | re.DOTALL
+)
+
+#: Child-relationship subquery ``(SELECT ... FROM Contacts ...)``.
+_SUBQUERY_RE = re.compile(
+    r"\(\s*SELECT\b([^()]*?)\bFROM\s+(\w+)[^()]*\)", re.IGNORECASE | re.DOTALL
+)
+
+#: Main ``SELECT <fields> FROM <object> <rest>`` once subqueries are removed.
+_MAIN_SOQL_RE = re.compile(r"SELECT\b(.*?)\bFROM\s+(\w+)(.*)$", re.IGNORECASE | re.DOTALL)
+
+#: A query whose text is built at run time: object unknowable statically.
+_DYNAMIC_QUERY_CALL_RE = re.compile(
+    r"\bDatabase\s*\.\s*(?:query|queryWithBinds|getQueryLocator|countQuery)\s*\(\s*(?!\[)",
+    re.IGNORECASE,
+)
+
+#: DML statement on a variable: ``update opps;`` (stripped code only).
+_DML_RE = re.compile(
+    r"\b(insert|update|upsert|delete|undelete)\s+(\w+)\s*;", re.IGNORECASE
+)
+#: DML on a constructor: ``insert new Account(Name = 'x');``.
+_DML_NEW_RE = re.compile(
+    r"\b(insert|update|upsert|delete|undelete)\s+new\s+(\w+)\s*\(", re.IGNORECASE
+)
+#: ``Database.update(opps, false)``.
+_DATABASE_DML_RE = re.compile(
+    r"\bDatabase\s*\.\s*(insert|update|upsert|delete|undelete)\w*\s*\(\s*(\w+)",
+    re.IGNORECASE,
+)
 
 #: for / while loop header (used to bracket loop bodies for in-loop detection).
-_LOOP_RE = re.compile(r"(?:for|while)\s*\([^)]*\)\s*\{")
+_LOOP_RE = re.compile(r"\b(?:for|while)\s*\([^)]*\)\s*\{")
 
 #: Collection declaration: ``List<Opportunity> opps`` -> opps maps to Opportunity.
 _COLLECTION_DECL_RE = re.compile(r"(?:List|Set)\s*<\s*(\w+)\s*>\s+(\w+)")
@@ -187,38 +225,116 @@ def _is_sobject_name(name: str) -> bool:
     return not name.lower().endswith("__r") and name not in _NON_SOBJECT_TYPES
 
 
-def _detect_soql_objects(source: str) -> list[tuple[str, int, bool]]:
-    """Detect SObjects queried via SOQL.
+def parse_soql(query: str) -> dict | None:
+    """Split one SOQL statement into its object, field paths and subqueries.
 
-    Returns a list of ``(sobject_name, line_no, in_loop)`` tuples. Child-relationship
-    (``__r``) subquery targets are skipped (see ``_is_sobject_name``).
+    Returns ``{"object", "select", "where", "children", "semi_joins"}`` where
+    ``select`` / ``where`` are field paths as written (``Name``,
+    ``Account.Owner.Name``), ``children`` is ``[(relationship_name, [field
+    paths])]`` for each ``(SELECT ... FROM <relationship>)`` subquery and
+    ``semi_joins`` holds the parsed ``IN (SELECT ...)`` queries. ``None`` if no
+    ``FROM``.
     """
-    loop_ranges = _find_loop_ranges(source)
-    results: list[tuple[str, int, bool]] = []
-    for match in _SOQL_RE.finditer(source):
-        sobject = match.group(1)
-        if not _is_sobject_name(sobject):
+    children: list[tuple[str, list[str]]] = []
+    semi_joins: list[dict] = []
+
+    def take_semi_join(match):
+        inner = parse_soql(match.group(1))
+        if inner:
+            semi_joins.append(inner)
+        return "IN ( )"
+
+    def take(match):
+        children.append((match.group(2), _soql_select_fields(match.group(1))))
+        return " "
+
+    flat = _SUBQUERY_RE.sub(take, _SEMI_JOIN_RE.sub(take_semi_join, query))
+    main = _MAIN_SOQL_RE.search(flat)
+    if not main:
+        return None
+    select, sobject, rest = main.groups()
+    where = re.split(
+        r"\b(?:ORDER\s+BY|LIMIT|GROUP\s+BY|OFFSET|FOR\s+(?:UPDATE|VIEW|REFERENCE)|WITH)\b",
+        rest, flags=re.IGNORECASE,
+    )[0]
+    where_fields = [
+        m.group(1) for m in re.finditer(
+            r"([A-Za-z]\w*(?:\.\w+)*)\s*(?:!=|<>|<=|>=|=|<|>|\bLIKE\b|\bNOT\s+IN\b|\bIN\b|"
+            r"\bINCLUDES\b|\bEXCLUDES\b)",
+            where, re.IGNORECASE,
+        )
+        if m.group(1).upper() not in ("WHERE", "AND", "OR", "NOT")
+    ]
+    return {
+        "object": sobject,
+        "select": _soql_select_fields(select),
+        "where": where_fields,
+        "children": children,
+        "semi_joins": semi_joins,
+    }
+
+
+def _soql_select_fields(select: str) -> list[str]:
+    """Field paths of a SELECT list (``COUNT(Id)`` -> ``Id``; TYPEOF/FIELDS dropped)."""
+    fields: list[str] = []
+    for item in select.split(","):
+        item = item.strip()
+        func = re.match(r"^\w+\s*\((.*)\)", item)
+        if func:
+            item = func.group(1).strip()
+        token = re.match(r"^([A-Za-z]\w*(?:\.\w+)*)", item)
+        if token and token.group(1).upper() not in ("TYPEOF", "FIELDS"):
+            fields.append(token.group(1))
+    return fields
+
+
+def _detect_soql(code: str, strings: list[tuple[int, str]]) -> list[dict]:
+    """SOQL sites in stripped *code* plus query-shaped string literals.
+
+    Each site: ``{"soql", "offset", "line", "in_loop", "dynamic"}`` where
+    ``soql`` is ``parse_soql``'s result. Inline ``[SELECT ...]`` sites are
+    static; a string literal that reads as a query is ``dynamic`` (it is passed
+    to ``Database.query`` or similar, so the call site is inferred, not seen).
+    """
+    loop_ranges = _find_loop_ranges(code)
+    sites: list[dict] = []
+    candidates = [(m.start(1), m.group(1), False) for m in _INLINE_SOQL_RE.finditer(code)]
+    candidates += [(pos, lit, True) for pos, lit in strings if _STRING_SOQL_RE.search(lit)]
+    for offset, text, dynamic in sorted(candidates):
+        soql = parse_soql(text)
+        if soql is None:
             continue
-        line_no = source[: match.start()].count("\n") + 1
-        results.append((sobject, line_no, _in_loop(line_no, loop_ranges)))
-    return results
+        line_no = code.count("\n", 0, offset) + 1
+        for query in (soql, *soql["semi_joins"]):
+            if not _is_sobject_name(query["object"]):
+                continue
+            sites.append({
+                "soql": query, "offset": offset, "line": line_no,
+                "in_loop": _in_loop(line_no, loop_ranges), "dynamic": dynamic,
+            })
+    return sites
 
 
 def _detect_dml_operations(
-    source: str, var_types: dict[str, str]
+    code: str, var_types: dict[str, str]
 ) -> list[tuple[str, str, int, bool]]:
-    """Detect DML operations.
+    """Detect DML statements in stripped *code*.
 
     Returns ``(dml_type, sobject_name, line_no, in_loop)``. ``sobject_name`` is
-    resolved from variable-type tracking, or ``"unknown"`` when not inferable.
+    resolved from variable-type tracking (or read from ``new <Type>(...)``), or
+    ``"unknown"`` when not inferable.
     """
-    loop_ranges = _find_loop_ranges(source)
+    loop_ranges = _find_loop_ranges(code)
+    found: list[tuple[int, str, str]] = []
+    for regex in (_DML_RE, _DATABASE_DML_RE):
+        for match in regex.finditer(code):
+            found.append((match.start(), match.group(1).upper(),
+                          var_types.get(match.group(2), "unknown")))
+    for match in _DML_NEW_RE.finditer(code):
+        found.append((match.start(), match.group(1).upper(), match.group(2)))
     results: list[tuple[str, str, int, bool]] = []
-    for match in _DML_RE.finditer(source):
-        dml_type = match.group(1).upper()
-        var_name = match.group(2)
-        sobject = var_types.get(var_name, "unknown")
-        line_no = source[: match.start()].count("\n") + 1
+    for offset, dml_type, sobject in sorted(found):
+        line_no = code.count("\n", 0, offset) + 1
         results.append((dml_type, sobject, line_no, _in_loop(line_no, loop_ranges)))
     return results
 
@@ -342,25 +458,29 @@ def extract_apex_enhanced(path: Path) -> dict:
     nodes.extend(methods.values())
 
     # 3. SOQL queries (cross-file resolution) -----------------------------
-    for sobject_name, line_no, in_loop in _detect_soql_objects(source):
+    for site in _detect_soql(code, _strings):
+        sobject_name = site["soql"]["object"]
         target_id = sobject_nid(sobject_name)
         _ensure_sobject_node(nodes, target_id, sobject_name, path)
-        edges.append(
-            {
-                "source": class_id,
-                "target": target_id,
-                "relation": "queries",
-                "confidence": "EXTRACTED",
-                "sf_in_loop": in_loop,
-                "source_location": f"L{line_no}",
-                "source_file": str(path),
-            }
-        )
+        edge = {
+            "source": class_id,
+            "target": target_id,
+            "relation": "queries",
+            "confidence": "EXTRACTED",
+            "sf_in_loop": site["in_loop"],
+            "source_location": f"L{site['line']}",
+            "source_file": str(path),
+        }
+        if site["dynamic"]:
+            edge.update(confidence="INFERRED", confidence_value=0.7, sf_dynamic=True)
+        edges.append(edge)
+    if _DYNAMIC_QUERY_CALL_RE.search(code):
+        nodes[0]["sf_dynamic_soql"] = True
 
     # 4. DML operations ---------------------------------------------------
-    var_types = _build_var_types(source)
+    var_types = _build_var_types(code)
     for dml_type, sobject_name, line_no, in_loop in _detect_dml_operations(
-        source, var_types
+        code, var_types
     ):
         target_id = sobject_nid(sobject_name)
         _ensure_sobject_node(nodes, target_id, sobject_name, path)
