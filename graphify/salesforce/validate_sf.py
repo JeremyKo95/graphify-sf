@@ -68,6 +68,9 @@ SF_RELATIONS = {
     # Permission
     "grants_access_to",     # Profile/PermSet -> Object/Field
     "field_of",             # Custom Field -> Custom Object
+    "lookup_to",            # Lookup / Master-Detail field -> referenced SObject
+    "reads_field",          # Apex / Flow / formula / Validation Rule -> Field read
+    "writes_field",         # Apex / Flow -> Field written
     "contains_permission_set",  # Permission Set Group -> Permission Set
 
     # Metadata coverage

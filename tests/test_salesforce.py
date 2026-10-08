@@ -15,6 +15,7 @@ from graphify.salesforce.constants import (
     apex_nid,
     field_nid,
     sobject_nid,
+    validation_rule_nid,
 )
 from graphify.salesforce.cpq import cpq_analysis_pass
 from graphify.salesforce.cpq_data import extract_cpq_data
@@ -170,6 +171,67 @@ def test_same_field_name_on_two_objects_stays_two_nodes(tmp_path: Path) -> None:
     }
 
 
+def _write_field(root: Path, obj: str, name: str, body: str) -> None:
+    f = root / "objects" / obj / "fields" / f"{name}.field-meta.xml"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        f"  <fullName>{name}</fullName>\n{body}\n</CustomField>\n", encoding="utf-8")
+
+
+def _field_edges(result: dict, relation: str) -> set[tuple[str, str]]:
+    return {(e["source"], e["target"]) for e in result["edges"] if e["relation"] == relation}
+
+
+def test_field_metadata_lookup_and_formula_reads(tmp_path: Path) -> None:
+    """Lookups become lookup_to; formulas read fields across __r paths; literals
+    and function names never become fields."""
+    _write_field(tmp_path, "Account", "Tier__c", "<type>Text</type>")
+    _write_field(tmp_path, "Account", "Region__c", "<type>Text</type>")
+    _write_field(tmp_path, "Site__c", "Account__c",
+                 "<type>Lookup</type><referenceTo>Account</referenceTo>"
+                 "<relationshipName>Sites</relationshipName>")
+    _write_field(tmp_path, "Site__c", "Label__c",
+                 "<type>Text</type><formula>IF(ISBLANK(Account__r.Tier__c), \"Tier__c\", "
+                 "Account__r.Tier__c &amp; Name &amp; $User.Id)</formula>")
+    vr = tmp_path / "objects" / "Account" / "validationRules" / "Need_Region.validationRule-meta.xml"
+    vr.parent.mkdir(parents=True)
+    vr.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <fullName>Need_Region</fullName>\n"
+        "  <errorConditionFormula>AND(ISPICKVAL(Tier__c, 'Gold'), ISBLANK(Region__c))"
+        "</errorConditionFormula>\n</ValidationRule>\n", encoding="utf-8")
+
+    result = extract_sf(tmp_path)
+    _assert_no_dangling_edges(result)
+    lookup = field_nid("Site__c", "Account__c")
+    assert (lookup, sobject_nid("Account")) in _field_edges(result, "lookup_to")
+    node = next(n for n in result["nodes"] if n["id"] == lookup)
+    assert node["sf_reference_to"] == ["Account"]
+    assert node["sf_relationship_name"] == "Sites"
+
+    reads = _field_edges(result, "reads_field")
+    label = field_nid("Site__c", "Label__c")
+    # Account__r.Tier__c walks the lookup to Account; the quoted "Tier__c",
+    # ISBLANK / IF and $User.Id are not fields; Name is not defined in the repo.
+    assert {t for s, t in reads if s == label} == {field_nid("Account", "Tier__c")}
+    rule = validation_rule_nid("Account", "Need_Region")
+    assert {t for s, t in reads if s == rule} == {
+        field_nid("Account", "Tier__c"), field_nid("Account", "Region__c")}
+
+
+def test_rollup_summary_reads_child_field(tmp_path: Path) -> None:
+    _write_field(tmp_path, "Opportunity", "Total_Lines__c",
+                 "<type>Summary</type><summarizedField>OpportunityLineItem.TotalPrice"
+                 "</summarizedField><summaryOperation>sum</summaryOperation>")
+    result = extract_sf(tmp_path)
+    assert (field_nid("Opportunity", "Total_Lines__c"),
+            field_nid("OpportunityLineItem", "TotalPrice")) in _field_edges(result, "reads_field")
+    _assert_no_dangling_edges(result)
+
+
 def test_definition_replaces_stub_regardless_of_file_order(tmp_path: Path) -> None:
     """An Apex FROM-clause stub seen first must not own the SObject node."""
     (tmp_path / "classes").mkdir()
@@ -207,17 +269,17 @@ def test_apex_identity_ignores_keywords_in_comments(tmp_path: Path) -> None:
     Real org: 212 Apex nodes were labelled ``for`` / ``Name`` / ``Handler`` and 53
     classes were typed as triggers because the declaration regex read comments.
     """
-    cls = tmp_path / "AI_AgentService.cls"
+    cls = tmp_path / "AgentService.cls"
     cls.write_text(
         "/**\n * Helper class for agents. Handles the trigger Name mapping.\n */\n"
-        "public with sharing class AI_AgentService {\n"
+        "public with sharing class AgentService {\n"
         "    // returns 'class Foo' style strings\n"
         "    public static String describe() { return 'trigger X on Y'; }\n"
         "}\n", encoding="utf-8")
     result = extract_apex_enhanced(cls)
     node = result["nodes"][0]
-    assert node["id"] == apex_nid("AI_AgentService")
-    assert node["label"] == "AI_AgentService"
+    assert node["id"] == apex_nid("AgentService")
+    assert node["label"] == "AgentService"
     assert node["sf_code_type"] == "class"
     assert not any(e["relation"] == "triggers_on" for e in result["edges"])
 
@@ -234,12 +296,12 @@ def test_apex_node_carries_no_source_text() -> None:
 
 
 def test_managed_hidden_class_is_kept_as_node(tmp_path: Path) -> None:
-    cls = tmp_path / "SSFLOW__CleanUpHelper.cls"
+    cls = tmp_path / "pkg__CleanUpHelper.cls"
     cls.write_text("(hidden)", encoding="utf-8")
     result = extract_apex_enhanced(cls)
     assert "error" not in result
     node = result["nodes"][0]
-    assert node["id"] == apex_nid("SSFLOW__CleanUpHelper")
+    assert node["id"] == apex_nid("pkg__CleanUpHelper")
     assert node["sf_managed_hidden"] is True
     assert result["edges"] == []
 
@@ -372,7 +434,7 @@ def test_soql_multiline_field_list(tmp_path: Path) -> None:
         return [
             SELECT
                 Name,
-                CLOUD_Current_Year_Total_Miles__c
+                Annual_Revenue_Band__c
             FROM Account
             WHERE Id = :x LIMIT 1
         ];
@@ -1486,11 +1548,11 @@ def test_resolve_node_matches_qualified_and_bare_field_names() -> None:
     from graphify.salesforce.query import resolve_node
 
     G = nx.MultiDiGraph()
-    fid = field_nid("Account", "CLOUD_Miles__c")
-    G.add_node(fid, label="Account.CLOUD_Miles__c", file_type="field",
-               sf_qualified_name="Account.CLOUD_Miles__c", sf_api_name="CLOUD_Miles__c")
-    assert resolve_node(G, "account.cloud_miles__c") == fid
-    assert resolve_node(G, "CLOUD_Miles__c") == fid
+    fid = field_nid("Account", "Revenue_Band__c")
+    G.add_node(fid, label="Account.Revenue_Band__c", file_type="field",
+               sf_qualified_name="Account.Revenue_Band__c", sf_api_name="Revenue_Band__c")
+    assert resolve_node(G, "account.revenue_band__c") == fid
+    assert resolve_node(G, "Revenue_Band__c") == fid
 
 
 def _sf_query_graph() -> nx.DiGraph:

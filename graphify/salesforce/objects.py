@@ -36,7 +36,14 @@ from graphify.salesforce.constants import (
 _NS = {"md": "http://soap.sforce.com/2006/04/metadata"}
 
 #: Field types that reference another SObject.
-_RELATIONSHIP_TYPES = {"Lookup", "MasterDetail"}
+_RELATIONSHIP_TYPES = {"Lookup", "MasterDetail", "Hierarchy", "MetadataRelationship"}
+
+#: A field-path token in a formula: not preceded by ``$`` (global variables),
+#: ``.`` (mid-path) or a word character.
+_FORMULA_PATH_RE = re.compile(r"(?<![\w.$])([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)")
+
+#: String literals inside a formula (picklist values, text) — never fields.
+_FORMULA_STRING_RE = re.compile(r"\"[^\"]*\"|'[^']*'")
 
 #: Identifier (and dotted reference) token in a Salesforce formula, e.g.
 #: ``SBQQ__Discount__c`` or ``Account.Owner.Name``.
@@ -79,6 +86,77 @@ def _extract_formula_fields(formula: str | None) -> list[str]:
             seen.add(token)
             fields.append(token)
     return fields
+
+
+def _formula_refs(source_id: str, object_api: str, formula: str | None,
+                  path: Path) -> list[dict]:
+    """``reads_field`` references for every field path a formula mentions.
+
+    Strict: the resolver keeps a reference only if it lands on a field defined
+    in the repo, so function names and literals never become fields.
+    """
+    from graphify.salesforce.field_refs import field_ref
+
+    if not formula:
+        return []
+    text = _FORMULA_STRING_RE.sub(" ", formula)
+    refs: list[dict] = []
+    seen: set[str] = set()
+    for match in _FORMULA_PATH_RE.finditer(text):
+        token = match.group(1)
+        if text[match.end():].lstrip().startswith("(") or token.upper() in _FORMULA_FUNCTIONS:
+            continue
+        if token.lower() not in seen:
+            seen.add(token.lower())
+            refs.append(field_ref(source_id, object_api, token, "reads_field", path,
+                                  confidence="EXTRACTED", strict=True))
+    return refs
+
+
+def _add_field(elem, object_api: str | None, field_name: str, path: Path,
+               nodes: list[dict], edges: list[dict], refs: list[dict]) -> None:
+    """Field node + ``field_of`` / ``lookup_to`` edges + formula references."""
+    field_type = elem.findtext("md:type", namespaces=_NS)
+    reference_to = [e.text.strip() for e in elem.findall("md:referenceTo", namespaces=_NS)
+                    if e.text and e.text.strip()]
+    if field_type == "Hierarchy" and not reference_to and object_api:
+        reference_to = [object_api]
+    node = field_node(
+        object_api, field_name, path,
+        sf_label=elem.findtext("md:label", namespaces=_NS),
+        sf_field_type=field_type,
+        sf_reference_to=reference_to or None,
+        sf_relationship_name=elem.findtext("md:relationshipName", namespaces=_NS),
+    )
+    nodes.append(node)
+    if not object_api:
+        return
+    sobject_id = sobject_nid(object_api)
+    _ensure_sobject_node(nodes, sobject_id, object_api, path)
+    edges.append({"source": node["id"], "target": sobject_id, "relation": "field_of",
+                  "confidence": "EXTRACTED", "source_file": str(path)})
+
+    for referenced in reference_to:
+        referenced_id = sobject_nid(referenced)
+        _ensure_sobject_node(nodes, referenced_id, referenced, path)
+        edges.append({"source": node["id"], "target": referenced_id,
+                      "relation": "lookup_to", "sf_relationship_type": field_type,
+                      "confidence": "EXTRACTED", "source_file": str(path)})
+        edges.append({"source": sobject_id, "target": referenced_id,
+                      "relation": "references", "sf_relationship_type": field_type,
+                      "sf_field_api_name": field_name,
+                      "confidence": "EXTRACTED", "source_file": str(path)})
+
+    refs.extend(_formula_refs(
+        node["id"], object_api, elem.findtext("md:formula", namespaces=_NS), path))
+    # Roll-up summary: "OpportunityLineItem.TotalPrice" on the child object.
+    summarized = elem.findtext("md:summarizedField", namespaces=_NS)
+    if summarized and "." in summarized:
+        from graphify.salesforce.field_refs import field_ref
+
+        child_obj, child_field = summarized.split(".", 1)
+        refs.append(field_ref(node["id"], child_obj, child_field, "reads_field", path,
+                              confidence="EXTRACTED", sf_rollup=True))
 
 
 def _object_api_from_path(path: Path) -> str:
@@ -170,51 +248,12 @@ def extract_custom_object(path: Path) -> dict:
         nodes[0]["sf_is_custom_setting"] = True
         nodes[0]["sf_setting_type"] = setting_type
 
-    # 2. Field nodes + field_of edges -------------------------------------
+    # 2. Embedded fields (MDAPI layout): node, field_of, lookup_to, formula refs
+    refs: list[dict] = []
     for field_elem in root.findall("md:fields", namespaces=_NS):
         field_name = field_elem.findtext("md:fullName", namespaces=_NS)
-        if not field_name:
-            continue
-        field_type = field_elem.findtext("md:type", namespaces=_NS)
-        node = field_node(
-            api_name, field_name, path,
-            sf_label=field_elem.findtext("md:label", namespaces=_NS),
-            sf_field_type=field_type,
-        )
-        field_id = node["id"]
-        nodes.append(node)
-
-        edges.append(
-            {
-                "source": field_id,
-                "target": sobject_id,
-                "relation": "field_of",
-                "confidence": "EXTRACTED",
-                "source_file": str(path),
-            }
-        )
-
-        # 3. Lookup / Master-Detail relationship --------------------------
-        if field_type in _RELATIONSHIP_TYPES:
-            referenced = field_elem.findtext("md:referenceTo", namespaces=_NS)
-            if referenced:
-                referenced_id = sobject_nid(referenced)
-                # Add a stub node for the referenced SObject so the edge is not
-                # dangling within this result. build_graph() merges this with the
-                # real node (from the referenced object's own *.object-meta.xml)
-                # via the shared sobject_nid (ADR-002, ADR-012).
-                _ensure_sobject_node(nodes, referenced_id, referenced, path)
-                edges.append(
-                    {
-                        "source": sobject_id,
-                        "target": referenced_id,
-                        "relation": "references",
-                        "sf_relationship_type": field_type,
-                        "sf_field_api_name": field_name,
-                        "confidence": "EXTRACTED",
-                        "source_file": str(path),
-                    }
-                )
+        if field_name:
+            _add_field(field_elem, api_name, field_name, path, nodes, edges, refs)
 
     # 4. Embedded Validation Rules (<validationRules> children) ------------
     for vr_elem in root.findall("md:validationRules", namespaces=_NS):
@@ -223,11 +262,12 @@ def extract_custom_object(path: Path) -> dict:
             continue
         formula = vr_elem.findtext("md:errorConditionFormula", namespaces=_NS)
         active = vr_elem.findtext("md:active", namespaces=_NS) != "false"
-        _add_validation_rule(
+        rule_id = _add_validation_rule(
             nodes, edges, api_name, sobject_id, rule_name, formula, active, path
         )
+        refs.extend(_formula_refs(rule_id, api_name, formula, path))
 
-    return {"nodes": nodes, "edges": edges}
+    return {"nodes": nodes, "edges": edges, "field_refs": refs}
 
 
 def _add_validation_rule(
@@ -239,8 +279,8 @@ def _add_validation_rule(
     formula: str | None,
     active: bool,
     path: Path,
-) -> None:
-    """Append a ``validation_rule`` node + a ``validates`` edge to its SObject.
+) -> str:
+    """Append a ``validation_rule`` node + a ``validates`` edge; return its ID.
 
     The node carries ``sf_referenced_fields`` (parsed from the error-condition
     formula) and ``sf_object`` so the CPQ ↔ Validation overlap pass
@@ -271,6 +311,7 @@ def _add_validation_rule(
             "source_file": str(path),
         }
     )
+    return rule_id
 
 
 def _ensure_sobject_node(
@@ -313,52 +354,12 @@ def extract_custom_field(path: Path) -> dict:
     # The field API name lives in <fullName>, falling back to the file stem
     # (e.g. "BillingCity__c.field-meta.xml" -> "BillingCity__c").
     field_name = root.findtext("md:fullName", namespaces=_NS) or path.name.split(".")[0]
-    field_type = root.findtext("md:type", namespaces=_NS)
-    parent_api = _parent_object_from_field_path(path)
-
-    node = field_node(
-        parent_api, field_name, path,
-        sf_label=root.findtext("md:label", namespaces=_NS),
-        sf_field_type=field_type,
-    )
-    field_id = node["id"]
-    nodes: list[dict] = [node]
+    nodes: list[dict] = []
     edges: list[dict] = []
-
-    if parent_api:
-        parent_id = sobject_nid(parent_api)
-        # Ensure the field_of edge is not dangling: include the parent SObject
-        # node so this dict is self-consistent (build merges it with any other
-        # parser's node for the same object via the shared sobject_nid).
-        nodes.append(sobject_stub(parent_api, path))
-        edges.append(
-            {
-                "source": field_id,
-                "target": parent_id,
-                "relation": "field_of",
-                "confidence": "EXTRACTED",
-                "source_file": str(path),
-            }
-        )
-
-        if field_type in _RELATIONSHIP_TYPES:
-            referenced = root.findtext("md:referenceTo", namespaces=_NS)
-            if referenced:
-                referenced_id = sobject_nid(referenced)
-                _ensure_sobject_node(nodes, referenced_id, referenced, path)
-                edges.append(
-                    {
-                        "source": parent_id,
-                        "target": referenced_id,
-                        "relation": "references",
-                        "sf_relationship_type": field_type,
-                        "sf_field_api_name": field_name,
-                        "confidence": "EXTRACTED",
-                        "source_file": str(path),
-                    }
-                )
-
-    return {"nodes": nodes, "edges": edges}
+    refs: list[dict] = []
+    _add_field(root, _parent_object_from_field_path(path), field_name, path,
+               nodes, edges, refs)
+    return {"nodes": nodes, "edges": edges, "field_refs": refs}
 
 
 def _parent_object_from_validation_path(path: Path) -> str | None:
@@ -420,8 +421,9 @@ def extract_validation_rule(path: Path) -> dict:
 
     nodes: list[dict] = []
     edges: list[dict] = []
-    _add_validation_rule(
+    rule_id = _add_validation_rule(
         nodes, edges, object_api, sobject_nid(object_api),
         rule_name, formula, active, path,
     )
-    return {"nodes": nodes, "edges": edges}
+    return {"nodes": nodes, "edges": edges,
+            "field_refs": _formula_refs(rule_id, object_api, formula, path)}

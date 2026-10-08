@@ -89,7 +89,7 @@ def field_nid(object_api: str | None, field_api: str) -> str:
     """Node ID for a field, qualified by its owning object.
 
     Examples:
-        field_nid("Account", "CLOUD_Miles__c") -> "field_account.cloud_miles__c"
+        field_nid("Account", "Region__c")      -> "field_account.region__c"
         field_nid(None, "Discount__c")         -> "field_?.discount__c"
 
     The object is part of the ID because field API names repeat across objects

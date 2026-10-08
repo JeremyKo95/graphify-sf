@@ -282,6 +282,9 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
         2. ``_merge_lwc_components``   — fold LWC HTML + JS into one node.
         2b. ``mdt_mapping_pass``       — turn field-mapping ``__mdt`` records into
            traversable ``maps_to`` field->field edges (e.g. Opp->Quote).
+        2c. ``resolve_field_refs``     — parsers' field references (formulas,
+           SOQL, Flow elements, Apex field access) become ``reads_field`` /
+           ``writes_field`` edges once every object's metadata is known.
         3. ``ooe_analysis_pass``       — Order of Execution chains.
         4. ``governor_limit_analysis_pass`` — diagnostic ``governor_violation``
            edges (appended to the edge list).
@@ -316,6 +319,7 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
         ``source_file`` values relative to *path* (its parent for a single file).
     """
     from .cpq import cpq_analysis_pass
+    from .field_refs import resolve_field_refs
     from .flow_cpq_loops import detect_flow_cpq_loops
     from .mdt_mapping import mdt_mapping_pass
     from .governor_limits import (
@@ -334,6 +338,7 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
 
     all_nodes: list[dict] = []
     all_edges: list[dict] = []
+    field_refs: list[dict] = []
     node_by_id: dict[str, dict] = {}
 
     for file_path in files:
@@ -350,6 +355,7 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
         for node in result.get("nodes", []):
             _merge_into(all_nodes, node_by_id, node)
         all_edges.extend(result.get("edges", []))
+        field_refs.extend(result.get("field_refs", []))
 
     # CPQ configuration data (SFDX JSON exports) — the rule LOGIC that lives as
     # SBQQ data records, not metadata files. Merged before the analysis passes so
@@ -368,6 +374,7 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
     _merge_lwc_components(all_nodes, all_edges)
     mdt_mapping_pass(all_nodes, all_edges)
     _resolve_unqualified_fields(all_nodes, all_edges)
+    resolve_field_refs(all_nodes, all_edges, field_refs)
     ooe_analysis_pass(all_nodes, all_edges)
     all_edges.extend(governor_limit_analysis_pass(all_nodes, all_edges))
     all_edges.extend(detect_recursive_triggers(all_nodes, all_edges))

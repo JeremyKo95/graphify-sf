@@ -58,6 +58,9 @@ SF_RELATION_TO_NEO4J_TYPE: dict[str, str] = {
     # Permission
     "grants_access_to": "GRANTS_ACCESS_TO",
     "field_of": "FIELD_OF",
+    "lookup_to": "LOOKUP_TO",
+    "reads_field": "READS_FIELD",
+    "writes_field": "WRITES_FIELD",
     # CPQ
     "cpq_applies_to": "CPQ_APPLIES_TO",
     # Order of Execution
