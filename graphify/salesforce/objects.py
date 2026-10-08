@@ -25,7 +25,12 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from graphify.salesforce.constants import sobject_nid
+from graphify.salesforce.constants import (
+    field_nid,
+    sobject_nid,
+    sobject_stub,
+    validation_rule_nid,
+)
 
 #: Salesforce metadata XML namespace.
 _NS = {"md": "http://soap.sforce.com/2006/04/metadata"}
@@ -76,20 +81,34 @@ def _extract_formula_fields(formula: str | None) -> list[str]:
     return fields
 
 
-def _validation_rule_nid(object_api: str, rule_name: str) -> str:
-    """Build a stable node ID for a Validation Rule (``validation_<obj>_<rule>``)."""
-    obj = object_api.lower().replace("__c", "").replace("__", "_")
-    rule = rule_name.lower()
-    return f"validation_{obj}_{rule}"
+def _object_api_from_path(path: Path) -> str:
+    """Object API name from ``<Object>.object-meta.xml``.
 
-
-def _field_nid(api_name: str) -> str:
-    """Build a stable node ID for a Custom Field.
-
-    Example: ``"BillingCity__c"`` -> ``"field_billingcity"``.
+    The file name — not ``<label>`` — carries the API name: ``<label>`` is the
+    display label ("Quote Line" for ``SBQQ__QuoteLine__c``), so keying the node
+    on it would split every object from the Apex / Flow references to it.
     """
-    normalized = api_name.lower().replace("__c", "").replace("__", "_")
-    return f"field_{normalized}"
+    return path.name.split(".")[0]
+
+
+def field_node(object_api: str | None, field_api: str, path: Path | str,
+               **attrs) -> dict:
+    """A ``field`` node keyed by ``Object.Field`` (shared by every field emitter)."""
+    qualified = f"{object_api}.{field_api}" if object_api else field_api
+    node = {
+        "id": field_nid(object_api, field_api),
+        "label": qualified,
+        "file_type": "field",
+        "source_file": str(path),
+        "sf_api_name": field_api,
+        "sf_qualified_name": qualified,
+    }
+    if object_api:
+        node["sf_object"] = object_api
+    else:
+        node["sf_unresolved"] = True
+    node.update({k: v for k, v in attrs.items() if v is not None})
+    return node
 
 
 def _parse_error_node(path: Path, error: Exception) -> dict:
@@ -123,18 +142,22 @@ def extract_custom_object(path: Path) -> dict:
         return _parse_error_node(path, exc)
 
     # 1. SObject node ------------------------------------------------------
-    label = root.findtext("md:label", namespaces=_NS) or path.stem
-    plural_label = root.findtext("md:pluralLabel", namespaces=_NS) or label
+    api_name = _object_api_from_path(path)
+    display_label = root.findtext("md:label", namespaces=_NS) or api_name
+    plural_label = root.findtext("md:pluralLabel", namespaces=_NS) or display_label
 
-    sobject_id = sobject_nid(label)  # CRITICAL: ADR-002 single source of truth
+    sobject_id = sobject_nid(api_name)  # CRITICAL: ADR-002 single source of truth
     nodes: list[dict] = [
         {
             "id": sobject_id,
-            "label": label,
+            "label": api_name,
             "file_type": "sobject",
             "source_file": str(path),
+            "sf_api_name": api_name,
+            "sf_qualified_name": api_name,
+            "sf_label": display_label,
             "sf_plural_label": plural_label,
-            "sf_object_type": "custom" if "__c" in label else "standard",
+            "sf_object_type": "custom" if "__c" in api_name else "standard",
         }
     ]
     edges: list[dict] = []
@@ -152,20 +175,14 @@ def extract_custom_object(path: Path) -> dict:
         field_name = field_elem.findtext("md:fullName", namespaces=_NS)
         if not field_name:
             continue
-        field_label = field_elem.findtext("md:label", namespaces=_NS) or field_name
         field_type = field_elem.findtext("md:type", namespaces=_NS)
-
-        field_id = _field_nid(field_name)
-        nodes.append(
-            {
-                "id": field_id,
-                "label": field_label,
-                "file_type": "field",
-                "source_file": str(path),
-                "sf_field_type": field_type,
-                "sf_api_name": field_name,
-            }
+        node = field_node(
+            api_name, field_name, path,
+            sf_label=field_elem.findtext("md:label", namespaces=_NS),
+            sf_field_type=field_type,
         )
+        field_id = node["id"]
+        nodes.append(node)
 
         edges.append(
             {
@@ -207,7 +224,7 @@ def extract_custom_object(path: Path) -> dict:
         formula = vr_elem.findtext("md:errorConditionFormula", namespaces=_NS)
         active = vr_elem.findtext("md:active", namespaces=_NS) != "false"
         _add_validation_rule(
-            nodes, edges, label, sobject_id, rule_name, formula, active, path
+            nodes, edges, api_name, sobject_id, rule_name, formula, active, path
         )
 
     return {"nodes": nodes, "edges": edges}
@@ -231,11 +248,12 @@ def _add_validation_rule(
     ``validates`` edges) both have what they need. ``_ensure_sobject_node`` keeps
     the ``validates`` edge from dangling.
     """
-    rule_id = _validation_rule_nid(object_api, rule_name)
+    rule_id = validation_rule_nid(object_api, rule_name)
     nodes.append(
         {
             "id": rule_id,
             "label": rule_name,
+            "sf_qualified_name": f"{object_api}.{rule_name}",
             "file_type": "validation_rule",
             "source_file": str(path),
             "sf_object": object_api,
@@ -261,15 +279,7 @@ def _ensure_sobject_node(
     """Append a stub ``sobject`` node for *sobject_id* if not already present."""
     if any(n["id"] == sobject_id for n in nodes):
         return
-    nodes.append(
-        {
-            "id": sobject_id,
-            "label": api_name,
-            "file_type": "sobject",
-            "source_file": str(path),
-            "sf_object_type": "custom" if "__c" in api_name else "standard",
-        }
-    )
+    nodes.append(sobject_stub(api_name, path))
 
 
 def _parent_object_from_field_path(path: Path) -> str | None:
@@ -303,37 +313,24 @@ def extract_custom_field(path: Path) -> dict:
     # The field API name lives in <fullName>, falling back to the file stem
     # (e.g. "BillingCity__c.field-meta.xml" -> "BillingCity__c").
     field_name = root.findtext("md:fullName", namespaces=_NS) or path.name.split(".")[0]
-    field_label = root.findtext("md:label", namespaces=_NS) or field_name
     field_type = root.findtext("md:type", namespaces=_NS)
+    parent_api = _parent_object_from_field_path(path)
 
-    field_id = _field_nid(field_name)
-    nodes: list[dict] = [
-        {
-            "id": field_id,
-            "label": field_label,
-            "file_type": "field",
-            "source_file": str(path),
-            "sf_field_type": field_type,
-            "sf_api_name": field_name,
-        }
-    ]
+    node = field_node(
+        parent_api, field_name, path,
+        sf_label=root.findtext("md:label", namespaces=_NS),
+        sf_field_type=field_type,
+    )
+    field_id = node["id"]
+    nodes: list[dict] = [node]
     edges: list[dict] = []
 
-    parent_api = _parent_object_from_field_path(path)
     if parent_api:
         parent_id = sobject_nid(parent_api)
         # Ensure the field_of edge is not dangling: include the parent SObject
         # node so this dict is self-consistent (build merges it with any other
         # parser's node for the same object via the shared sobject_nid).
-        nodes.append(
-            {
-                "id": parent_id,
-                "label": parent_api,
-                "file_type": "sobject",
-                "source_file": str(path),
-                "sf_object_type": "custom" if "__c" in parent_api else "standard",
-            }
-        )
+        nodes.append(sobject_stub(parent_api, path))
         edges.append(
             {
                 "source": field_id,
@@ -406,7 +403,7 @@ def extract_validation_rule(path: Path) -> dict:
     if object_api is None:
         # Layout doesn't reveal the object: emit the rule node alone (no edge)
         # so the formula's fields are still recorded, never a dangling edge.
-        rule_id = _validation_rule_nid(path.stem, rule_name)
+        rule_id = validation_rule_nid("?", rule_name)
         return {
             "nodes": [
                 {

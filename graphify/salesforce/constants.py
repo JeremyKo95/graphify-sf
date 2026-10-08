@@ -2,7 +2,9 @@
 graphify-sf: Salesforce domain constants and helpers.
 
 This module is the *single source of truth* for:
-    - SObject node ID generation (`sobject_nid`) — ADR-002
+    - SObject node ID generation (`sobject_nid`) — ADR-002, and the other
+      API-name-based IDs (`field_nid`, `apex_nid`, `apex_method_nid`,
+      `validation_rule_nid`)
     - Governor Limits values + staleness metadata — ADR-006, ADR-026
     - Salesforce Order of Execution (OoE) step definitions
     - CPQ (SBQQ__) object / interface constants
@@ -50,9 +52,71 @@ def sobject_nid(api_name: str) -> str:
     Returns:
         Node ID in the form ``"sobject_{normalized_api_name}"``.
     """
+    return f"sobject_{_normalize_api(api_name)}"
+
+
+def sobject_stub(api_name: str, source_file) -> dict:
+    """A referenced-but-not-yet-defined SObject node (``sf_stub=True``).
+
+    Parsers emit stubs so their edges never dangle; ``extract_sf`` lets the
+    object's own definition replace the stub, and a stub that survives means the
+    object has no metadata in the repo (standard / managed-package object).
+    """
+    return {
+        "id": sobject_nid(api_name),
+        "label": api_name,
+        "file_type": "sobject",
+        "source_file": str(source_file),
+        "sf_api_name": api_name,
+        "sf_qualified_name": api_name,
+        "sf_object_type": "custom" if "__" in api_name else "standard",
+        "sf_stub": True,
+    }
+
+
+def _normalize_api(api_name: str) -> str:
     normalized = unicodedata.normalize("NFKC", api_name.strip()).lower()
-    normalized = _SOBJECT_ID_DISALLOWED.sub("_", normalized)
-    return f"sobject_{normalized}"
+    return _SOBJECT_ID_DISALLOWED.sub("_", normalized)
+
+
+#: Object segment of a field ID whose owning object could not be determined
+#: (e.g. a CPQ condition naming only a field). ``?`` never survives
+#: ``_normalize_api``, so it cannot collide with a real object.
+UNRESOLVED_OBJECT = "?"
+
+
+def field_nid(object_api: str | None, field_api: str) -> str:
+    """Node ID for a field, qualified by its owning object.
+
+    Examples:
+        field_nid("Account", "CLOUD_Miles__c") -> "field_account.cloud_miles__c"
+        field_nid(None, "Discount__c")         -> "field_?.discount__c"
+
+    The object is part of the ID because field API names repeat across objects
+    (``Name``, ``OwnerId``, ``Status__c`` …); ``__c`` is kept so a custom field
+    never merges with a same-named standard field.
+    """
+    obj = _normalize_api(object_api) if object_api else UNRESOLVED_OBJECT
+    return f"field_{obj}.{_normalize_api(field_api)}"
+
+
+def apex_nid(class_name: str) -> str:
+    """Node ID for an Apex class / trigger: ``apex_<name>``."""
+    return f"apex_{_normalize_api(class_name)}"
+
+
+def apex_method_nid(class_name: str, method_name: str) -> str:
+    """Node ID for an Apex method: ``apex_<class>.<method>``.
+
+    The ``.`` separator keeps ``Foo_Bar.baz`` and ``Foo.bar_baz`` distinct.
+    Overloads share one node (callers such as LWC imports cannot tell them apart).
+    """
+    return f"apex_{_normalize_api(class_name)}.{_normalize_api(method_name)}"
+
+
+def validation_rule_nid(object_api: str, rule_name: str) -> str:
+    """Node ID for a Validation Rule: ``validation_<object>.<rule>``."""
+    return f"validation_{_normalize_api(object_api)}.{_normalize_api(rule_name)}"
 
 
 # ---------------------------------------------------------------------------

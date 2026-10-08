@@ -36,7 +36,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from graphify.salesforce.constants import sobject_nid
+from graphify.salesforce.constants import sobject_nid, sobject_stub
 
 _NS = {"md": "http://soap.sforce.com/2006/04/metadata"}
 
@@ -59,12 +59,7 @@ def _error_node(node_id: str, path: Path, exc: Exception) -> dict:
 def _sobject_stub(nodes: list[dict], object_api: str, path: Path) -> str:
     sid = sobject_nid(object_api)
     if not any(n["id"] == sid for n in nodes):
-        custom = any(s in object_api for s in ("__c", "__mdt", "__e"))
-        nodes.append({
-            "id": sid, "label": object_api, "file_type": "sobject",
-            "source_file": str(path),
-            "sf_object_type": "custom" if custom else "standard",
-        })
+        nodes.append(sobject_stub(object_api, path))
     return sid
 
 

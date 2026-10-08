@@ -15,7 +15,7 @@ Extracted signal:
 
 CRITICAL (ADR-002 / how-it-works "cross-file resolution"): ``wire_to`` edges
 target the SAME Apex method node ID the Apex parser produces
-(``apex_<class>_<method>``), so ``build_graph()`` resolves the LWC -> Apex link
+(``constants.apex_method_nid`` -> ``apex_<class>.<method>``), so ``build_graph()`` resolves the LWC -> Apex link
 without a dedicated pass. The referenced Apex method is emitted as a stub node
 to keep this result free of dangling edges (ADR-012); the stub merges with the
 real method node from ``apex_enhanced.py``.
@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+
+from graphify.salesforce.constants import apex_method_nid
 
 #: ``@wire(<reference>, { ... })`` — capture the decorator's first argument
 #: (the imported adapter / Apex method name).
@@ -49,23 +51,26 @@ _API_PROP_RE = re.compile(r"@api\s+(\w+)")
 _CLASS_DECL_RE = re.compile(r"export\s+default\s+class\s+(\w+)")
 
 
+def _bundle_name(path: Path) -> str:
+    """Component (bundle) name: the folder directly under ``lwc/``.
+
+    Every file of a bundle (``<bundle>.js``, ``utils.js``, extra templates) maps
+    to the bundle, so helper files with common names never collide across
+    bundles. Outside an ``lwc/<bundle>/`` layout the file stem is used.
+    """
+    if path.parent.parent.name.lower() == "lwc":
+        return path.parent.name
+    return path.stem
+
+
 def _lwc_id(path: Path) -> str:
-    """Build the component node ID (``lwc_<lowercased-stem>``).
+    """Build the component node ID (``lwc_<lowercased-bundle>``).
 
-    The HTML and JS files of one component share a stem, so both parsers derive
-    the same base ID; the file-type suffix (html/js) is recorded as a node
-    attribute rather than baked into the ID.
+    The HTML and JS files of one component share a bundle, so both parsers
+    derive the same base ID; the file-type suffix (html/js) is recorded as a
+    node attribute rather than baked into the ID.
     """
-    return f"lwc_{path.stem.lower()}"
-
-
-def _apex_method_nid(apex_class: str, apex_method: str) -> str:
-    """Build the Apex method node ID matching ``apex_enhanced.py``.
-
-    Mirrors ``apex_<class-stem>_<method>`` so a ``wire_to`` edge resolves to the
-    method node the Apex parser emits (cross-file resolution, ADR-002).
-    """
-    return f"apex_{apex_class.lower()}_{apex_method.lower()}"
+    return f"lwc_{_bundle_name(path).lower()}"
 
 
 def _parse_error_node(path: Path, error_type: str, error: Exception) -> dict:
@@ -108,7 +113,8 @@ def extract_lwc_html(path: Path) -> dict:
         "nodes": [
             {
                 "id": f"{_lwc_id(path)}_html",
-                "label": f"{path.stem} (HTML)",
+                "label": _bundle_name(path),
+                "sf_qualified_name": _bundle_name(path),
                 "file_type": "lwc_component",
                 "source_file": str(path),
                 "sf_lwc_file_type": "html",
@@ -142,11 +148,14 @@ def extract_lwc_js(path: Path) -> dict:
     class_decl = _CLASS_DECL_RE.search(js_content)
     component_node: dict = {
         "id": lwc_id,
-        "label": class_decl.group(1) if class_decl else path.stem,
+        "label": _bundle_name(path),
+        "sf_qualified_name": _bundle_name(path),
         "file_type": "lwc_component",
         "source_file": str(path),
         "sf_lwc_file_type": "js",
     }
+    if class_decl:
+        component_node["sf_js_class"] = class_decl.group(1)
     nodes: list[dict] = [component_node]
     edges: list[dict] = []
 
@@ -157,7 +166,7 @@ def extract_lwc_js(path: Path) -> dict:
     }
 
     def _ensure_apex_stub(apex_class: str, apex_method: str) -> str:
-        apex_id = _apex_method_nid(apex_class, apex_method)
+        apex_id = apex_method_nid(apex_class, apex_method)
         if not any(n["id"] == apex_id for n in nodes):
             nodes.append(
                 {
@@ -166,6 +175,8 @@ def extract_lwc_js(path: Path) -> dict:
                     "file_type": "code",
                     "source_file": str(path),
                     "sf_method_type": "method",
+                    "sf_qualified_name": f"{apex_class}.{apex_method}",
+                    "sf_stub": True,
                 }
             )
         return apex_id

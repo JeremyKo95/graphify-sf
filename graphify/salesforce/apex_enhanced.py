@@ -4,8 +4,13 @@ graphify-sf: Enhanced Apex parser (classes, triggers, SOQL/DML, governor hints).
 Regex-based parser for Apex ``*.cls`` / ``*.trigger`` files (ADR-019 — regex
 first, tree-sitter deferred to Phase 3). It extracts:
 
-    - The class / trigger definition node (full source kept for later passes).
-    - Method signatures (``calls`` edge back to the owning class).
+    - The class / trigger definition node. Identity comes from the file name
+      (``<Name>.cls`` / ``<Name>.trigger``) and the kind from the extension, so
+      a ``class`` / ``trigger`` word inside a comment can never rename or
+      re-type the node. The raw source rides along as the transient ``_source``
+      attribute for the CPQ / governor passes; ``extract_sf`` drops it.
+    - Method signatures (``member_of`` edge back to the owning class).
+    - ``triggers_on`` edge from a trigger to its SObject (with the DML events).
     - SOQL queries (``queries`` edge -> SObject, ``sf_in_loop`` tagged).
     - DML operations (``dml_operates_on`` edge -> SObject, ``sf_in_loop`` tagged).
     - ``implements`` of well-known interfaces (QCP, Database.Batchable hint).
@@ -27,22 +32,29 @@ analysis — regex only.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
 from graphify.salesforce.constants import (
     CPQ_QCP_INTERFACE,
+    apex_method_nid,
+    apex_nid,
     sobject_nid,
+    sobject_stub,
 )
 
 # ---------------------------------------------------------------------------
 # Regexes
 # ---------------------------------------------------------------------------
 
-#: Class / trigger declaration. Anchored on the ``class``/``trigger`` keyword so
-#: a trigger at file start (no leading modifier/whitespace) still matches — the
-#: naive ``(?:public|private)?\s+`` form misses it.
-_DEFINITION_RE = re.compile(r"\b(class|trigger)\s+(\w+)", re.IGNORECASE)
+#: Type declaration in a ``.cls`` file, matched on comment/string-stripped code.
+_TYPE_DECL_RE = re.compile(r"\b(class|interface|enum)\s+(\w+)", re.IGNORECASE)
+
+#: ``trigger <Name> on <SObject> (<events>)``, matched on stripped code.
+_TRIGGER_DECL_RE = re.compile(
+    r"\btrigger\s+(\w+)\s+on\s+(\w+)\s*\(([^)]*)\)", re.IGNORECASE
+)
 
 #: Method signature. A visibility modifier is REQUIRED to avoid matching control
 #: flow (``else if (...)``, ``for (...)``) as methods. Captures return type,
@@ -74,6 +86,48 @@ _NON_SOBJECT_TYPES = {
     "Date", "Datetime", "Time", "Blob", "Object", "List", "Set", "Map",
     "Trigger", "System", "Database", "void", "SObject",
 }
+
+
+def strip_apex(source: str) -> tuple[str, list[tuple[int, str]]]:
+    """Blank out comments and string-literal contents, preserving offsets.
+
+    Returns ``(code, strings)``: ``code`` has the same length and line breaks as
+    ``source`` (so match offsets map to the same line numbers), with comments
+    replaced by spaces and string contents blanked between their quotes;
+    ``strings`` lists ``(offset, literal)`` for every string literal.
+    """
+    out: list[str] = []
+    strings: list[tuple[int, str]] = []
+    i, n = 0, len(source)
+    while i < n:
+        c = source[i]
+        if c == "/" and source.startswith("/", i + 1):
+            j = source.find("\n", i)
+            j = n if j == -1 else j
+            out.append(" " * (j - i))
+            i = j
+        elif c == "/" and source.startswith("*", i + 1):
+            j = source.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            out.append(re.sub(r"[^\n]", " ", source[i:j]))
+            i = j
+        elif c == "'":
+            j = i + 1
+            while j < n and source[j] not in "'\n":
+                j += 2 if source[j] == "\\" else 1
+            j = min(j, n)
+            literal = source[i + 1:j]
+            strings.append((i, literal))
+            if j < n and source[j] == "'":
+                out.append("'" + " " * len(literal) + "'")
+                i = j + 1
+            else:
+                out.append("'" + " " * len(literal))
+                i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out), strings
 
 
 def _find_loop_ranges(source: str) -> list[tuple[int, int]]:
@@ -175,17 +229,12 @@ def _ensure_sobject_node(
     """Append a stub ``sobject`` node for *sobject_id* if not already present.
 
     Keeps cross-file edges (queries / dml_operates_on) non-dangling within this
-    result; ``build_graph()`` merges the stub with the real object node via the
-    shared ``sobject_nid`` (ADR-002, ADR-012).
+    result; ``extract_sf`` replaces the stub with the object's own definition via
+    the shared ``sobject_nid`` (ADR-002, ADR-012).
     """
     if any(n["id"] == sobject_id for n in nodes):
         return
-    node: dict = {
-        "id": sobject_id,
-        "label": api_name,
-        "file_type": "sobject",
-        "source_file": str(path),
-    }
+    node = sobject_stub(api_name, path)
     if api_name == "unknown":
         node["sf_ambiguous"] = True
     nodes.append(node)
@@ -202,57 +251,95 @@ def extract_apex_enhanced(path: Path) -> dict:
     path = Path(path)
     with open(path, "r", encoding="utf-8") as f:
         source = f.read()
+    code, _strings = strip_apex(source)
 
     nodes: list[dict] = []
     edges: list[dict] = []
 
     # 1. Class / trigger definition --------------------------------------
-    definition = _DEFINITION_RE.search(source)
-    if not definition:
+    name = path.name.split(".")[0]
+    is_trigger = path.suffix == ".trigger"
+    trigger_decl = _TRIGGER_DECL_RE.search(code) if is_trigger else None
+    type_decl = None if is_trigger else _TYPE_DECL_RE.search(code)
+    # Managed-package classes ship with the body "(hidden)": real classes
+    # (profiles grant access to them) whose contents cannot be analyzed.
+    hidden = source.strip() == "(hidden)"
+    if not (trigger_decl or type_decl or hidden):
         return {"nodes": [], "edges": [], "error": "No class/trigger found"}
 
-    code_type = definition.group(1).lower()  # "class" | "trigger"
-    class_name = definition.group(2)
-    class_id = f"apex_{path.stem.lower()}"
-
+    class_id = apex_nid(name)
     nodes.append(
         {
             "id": class_id,
-            "label": class_name,
+            "label": name,
             "file_type": "code",
             "source_file": str(path),
-            "sf_code_type": "trigger" if code_type == "trigger" else "class",
-            "source": source,  # kept for CPQ / governor passes
+            "sf_qualified_name": name,
+            "sf_code_type": (
+                "trigger" if is_trigger
+                else type_decl.group(1).lower() if type_decl else "class"
+            ),
+            "sf_loc": source.count("\n") + 1,
+            "sf_source_hash": hashlib.sha256(source.encode("utf-8")).hexdigest()[:16],
+            "_source": source,
         }
     )
 
+    if hidden:
+        nodes[0]["sf_managed_hidden"] = True
+        return {"nodes": nodes, "edges": edges}
+
+    if trigger_decl:
+        sobject_name = trigger_decl.group(2)
+        target_id = sobject_nid(sobject_name)
+        _ensure_sobject_node(nodes, target_id, sobject_name, path)
+        events = [" ".join(e.split()).lower() for e in trigger_decl.group(3).split(",")]
+        edges.append(
+            {
+                "source": class_id,
+                "target": target_id,
+                "relation": "triggers_on",
+                "confidence": "EXTRACTED",
+                "source_file": str(path),
+                "sf_trigger_events": [e for e in events if e],
+            }
+        )
+
     # 2. Method signatures ------------------------------------------------
-    for method in _METHOD_RE.finditer(source):
+    methods: dict[str, dict] = {}
+    for method in _METHOD_RE.finditer(code):
         return_type, method_name, params = (
             method.group(2),
             method.group(3),
             method.group(4),
         )
-        method_id = f"{class_id}_{method_name.lower()}"
-        nodes.append(
-            {
-                "id": method_id,
-                "label": f"{method_name}({params})",
-                "file_type": "code",
-                "source_file": str(path),
-                "sf_return_type": return_type,
-                "sf_method_type": "method",
-            }
-        )
+        signature = f"{method_name}({' '.join(params.split())})"
+        method_id = apex_method_nid(name, method_name)
+        existing = methods.get(method_id)
+        if existing is not None:
+            existing["sf_signatures"].append(signature)
+            continue
+        methods[method_id] = {
+            "id": method_id,
+            "label": f"{name}.{method_name}",
+            "file_type": "code",
+            "source_file": str(path),
+            "sf_qualified_name": f"{name}.{method_name}",
+            "sf_return_type": return_type,
+            "sf_method_type": "method",
+            "sf_signatures": [signature],
+            "source_location": f"L{source.count(chr(10), 0, method.start()) + 1}",
+        }
         edges.append(
             {
                 "source": method_id,
                 "target": class_id,
-                "relation": "calls",
+                "relation": "member_of",
                 "confidence": "EXTRACTED",
                 "source_file": str(path),
             }
         )
+    nodes.extend(methods.values())
 
     # 3. SOQL queries (cross-file resolution) -----------------------------
     for sobject_name, line_no, in_loop in _detect_soql_objects(source):
@@ -294,8 +381,8 @@ def extract_apex_enhanced(path: Path) -> dict:
 
     # 5. Implements (QCP / Batchable hint) --------------------------------
     if (
-        f"implements {CPQ_QCP_INTERFACE}" in source
-        or "implements QuoteCalculatorPlugin" in source
+        f"implements {CPQ_QCP_INTERFACE}" in code
+        or "implements QuoteCalculatorPlugin" in code
     ):
         qcp_id = "sbqq_quotecalculatorplugin"
         if not any(n["id"] == qcp_id for n in nodes):
@@ -305,7 +392,9 @@ def extract_apex_enhanced(path: Path) -> dict:
                     "label": CPQ_QCP_INTERFACE,
                     "file_type": "code",
                     "source_file": str(path),
+                    "sf_qualified_name": CPQ_QCP_INTERFACE,
                     "sf_code_type": "interface",
+                    "sf_stub": True,
                 }
             )
         edges.append(
@@ -318,7 +407,7 @@ def extract_apex_enhanced(path: Path) -> dict:
             }
         )
 
-    if "implements Database.Batchable" in source:
+    if "implements Database.Batchable" in code:
         nodes[0]["sf_async_pattern"] = "batchable"
 
     return {"nodes": nodes, "edges": edges}

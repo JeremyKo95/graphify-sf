@@ -6,9 +6,10 @@ Graph-wide analysis pass that runs *after* per-file extraction and *before*
 실행 순서"). It enriches the merged graph with Salesforce CPQ (SteelBrick)
 semantics:
 
-    1. Reclassify SBQQ__ objects: nodes whose label carries the CPQ managed
-       package prefix become ``cpq_rule`` (so OoE / Neo4j export treat them as
-       CPQ rules, not generic SObjects).
+    1. Tag CPQ managed-package metadata: SObjects / fields whose API name starts
+       with ``SBQQ__`` get ``sf_cpq_managed=True``. Their ``file_type`` is NOT
+       changed — ``SBQQ__Quote__c`` is an SObject, not a rule; real Price /
+       Product Rules are ``cpq_rule`` nodes from the CPQ data ingester.
     2. Detect QCP implementations: Apex classes implementing
        ``SBQQ.QuoteCalculatorPlugin`` are tagged, and one ``cpq_qcp_method`` node
        is created per QCP callback found in the source — these model the Calc
@@ -85,7 +86,7 @@ def cpq_analysis_pass(all_nodes: list[dict], all_edges: list[dict]) -> None:
 
     Modifies ``all_nodes`` and ``all_edges`` in place (returns ``None``):
 
-        - SBQQ__ prefixed nodes are reclassified to ``cpq_rule``.
+        - ``SBQQ__`` SObjects / fields are tagged ``sf_cpq_managed``.
         - QCP ``SBQQ.QuoteCalculatorPlugin`` implementations are detected and a
           ``cpq_qcp_method`` node is added per implemented callback.
         - ``cpq_applies_to`` edges receive an ``execution_order`` attribute.
@@ -96,22 +97,23 @@ def cpq_analysis_pass(all_nodes: list[dict], all_edges: list[dict]) -> None:
         all_nodes: Merged node list across all extracted files (mutated).
         all_edges: Merged edge list across all extracted files (mutated).
     """
-    # 1. Reclassify SBQQ__ nodes to cpq_rule -----------------------------------
-    # Use the explicit ``SBQQ__`` prefix (not a bare ``SBQQ`` startswith): the
-    # latter would wrongly catch the ``SBQQ.QuoteCalculatorPlugin`` interface
-    # node emitted by the Apex parser.
+    # 1. Tag CPQ managed-package SObjects / fields ----------------------------
+    # Matched on the API name, never the label: a label substring match used to
+    # turn Apex methods with ``SBQQ__Quote__c`` in their signature, Validation
+    # Rules and the Quote SObject itself into ``cpq_rule`` nodes.
     for node in all_nodes:
-        label = node.get("label", "")
-        if CPQ_RULE_PREFIX in label:
-            node["file_type"] = "cpq_rule"
-            node["sf_cpq_object"] = label
+        if node.get("file_type") not in ("sobject", "field"):
+            continue
+        names = (node.get("sf_api_name") or "", node.get("sf_object") or "")
+        if any(n.startswith(CPQ_RULE_PREFIX) for n in names):
+            node["sf_cpq_managed"] = True
 
     # 2. Detect QCP interface implementations ----------------------------------
     # Iterate over a snapshot of the current code nodes: we append new
     # ``cpq_qcp_method`` nodes below and must not re-scan them.
     code_nodes = [n for n in all_nodes if n.get("file_type") == "code"]
     for node in code_nodes:
-        source = node.get("source", "")
+        source = node.get("_source", "")
         if not source:
             continue
         if (

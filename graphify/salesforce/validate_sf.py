@@ -52,7 +52,9 @@ SF_FILE_TYPES = {
 
 SF_RELATIONS = {
     # Apex
-    "triggers_on",          # Apex Trigger -> SObject
+    "triggers_on",          # Apex Trigger / record-triggered Flow -> SObject
+    "member_of",            # Apex method -> owning class
+    "implements",           # Apex class -> interface (e.g. SBQQ QCP)
     "queries",              # SOQL site -> SObject
     "dml_operates_on",      # DML site -> SObject
 

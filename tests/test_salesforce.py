@@ -10,7 +10,12 @@ import networkx as nx
 
 from graphify.salesforce import extract_sf
 from graphify.salesforce.apex_enhanced import extract_apex_enhanced
-from graphify.salesforce.constants import sobject_nid
+from graphify.salesforce.constants import (
+    apex_method_nid,
+    apex_nid,
+    field_nid,
+    sobject_nid,
+)
 from graphify.salesforce.cpq import cpq_analysis_pass
 from graphify.salesforce.cpq_data import extract_cpq_data
 from graphify.salesforce.flow import extract_flow
@@ -62,8 +67,17 @@ def _assert_no_dangling_edges(result: dict) -> None:
         assert edge["target"] in node_ids, f"dangling target: {edge}"
 
 
-def test_objects_parser() -> None:
-    fixture = FIXTURES / "sf_Account.object-meta.xml"
+def _sfdx_object_file(tmp_path: Path, api_name: str, source: Path) -> Path:
+    """Copy an object fixture into the SFDX layout objects/<Api>/<Api>.object-meta.xml."""
+    target = tmp_path / "objects" / api_name / f"{api_name}.object-meta.xml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    return target
+
+
+def test_objects_parser(tmp_path: Path) -> None:
+    fixture = _sfdx_object_file(
+        tmp_path, "Account", FIXTURES / "sf_Account.object-meta.xml")
     result = extract_custom_object(fixture)
 
     # 1. No error
@@ -93,6 +107,15 @@ def test_objects_parser() -> None:
         "BillingCity__c",
         "RelatedOpportunity__c",
     }
+    # Field IDs are qualified by their object and keep the __c suffix.
+    assert {n["id"] for n in field_nodes} == {
+        "field_account.billingcity__c",
+        "field_account.relatedopportunity__c",
+    }
+    billing = next(n for n in field_nodes if n["sf_api_name"] == "BillingCity__c")
+    assert billing["label"] == billing["sf_qualified_name"] == "Account.BillingCity__c"
+    assert billing["sf_label"] == "Billing City"
+    assert billing["sf_object"] == "Account"
 
     # 5. Lookup relationship detected -> references edge to Opportunity
     references = [e for e in result["edges"] if e["relation"] == "references"]
@@ -102,6 +125,151 @@ def test_objects_parser() -> None:
     assert ref["target"] == sobject_nid("Opportunity")
     assert ref["sf_relationship_type"] == "Lookup"
     assert ref["sf_field_api_name"] == "RelatedOpportunity__c"
+
+
+def test_object_id_comes_from_api_name_not_display_label(tmp_path: Path) -> None:
+    """<label> is a display label ("Quote Line"); the node must key on the API name.
+
+    Real org: 836 of 1,232 objects had label != API name, so every one of them
+    was split from the Apex / Flow references to it.
+    """
+    obj = tmp_path / "objects" / "SBQQ__QuoteLine__c" / "SBQQ__QuoteLine__c.object-meta.xml"
+    obj.parent.mkdir(parents=True)
+    obj.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <label>Quote Line</label>\n"
+        "</CustomObject>\n", encoding="utf-8")
+    node = extract_custom_object(obj)["nodes"][0]
+    assert node["id"] == sobject_nid("SBQQ__QuoteLine__c")
+    assert node["label"] == "SBQQ__QuoteLine__c"
+    assert node["sf_label"] == "Quote Line"
+
+
+def test_same_field_name_on_two_objects_stays_two_nodes(tmp_path: Path) -> None:
+    """``Status__c`` on Account and on Contact are different fields.
+
+    Real org: 19,443 field files collapsed into 12,106 nodes; ``field_name`` was
+    attached to 164 objects at once.
+    """
+    for obj in ("Account", "Contact"):
+        f = tmp_path / "objects" / obj / "fields" / "Status__c.field-meta.xml"
+        f.parent.mkdir(parents=True)
+        f.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+            "  <fullName>Status__c</fullName><type>Text</type>\n"
+            "</CustomField>\n", encoding="utf-8")
+    result = extract_sf(tmp_path)
+    fields = {n["id"]: n for n in result["nodes"] if n["file_type"] == "field"}
+    assert set(fields) == {field_nid("Account", "Status__c"), field_nid("Contact", "Status__c")}
+    field_of = {(e["source"], e["target"]) for e in result["edges"] if e["relation"] == "field_of"}
+    assert field_of == {
+        (field_nid("Account", "Status__c"), sobject_nid("Account")),
+        (field_nid("Contact", "Status__c"), sobject_nid("Contact")),
+    }
+
+
+def test_definition_replaces_stub_regardless_of_file_order(tmp_path: Path) -> None:
+    """An Apex FROM-clause stub seen first must not own the SObject node."""
+    (tmp_path / "classes").mkdir()
+    (tmp_path / "classes" / "AService.cls").write_text(
+        "public class AService { public void f() { List<Widget__c> w = [SELECT Id FROM Widget__c]; } }",
+        encoding="utf-8")
+    obj = tmp_path / "objects" / "Widget__c" / "Widget__c.object-meta.xml"
+    obj.parent.mkdir(parents=True)
+    obj.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <label>Widget</label>\n</CustomObject>\n", encoding="utf-8")
+    result = extract_sf(tmp_path)
+    widget = next(n for n in result["nodes"] if n["id"] == sobject_nid("Widget__c"))
+    assert widget["source_file"].endswith("Widget__c.object-meta.xml")
+    assert widget["sf_label"] == "Widget"
+    assert "sf_stub" not in widget
+    assert any(e["relation"] == "queries" and e["target"] == widget["id"]
+               for e in result["edges"])
+
+    # Definition first, stub later: the stub must not mark the definition.
+    (tmp_path / "zz").mkdir()
+    (tmp_path / "zz" / "ZService.cls").write_text(
+        "public class ZService { public void f() { List<Widget__c> w = [SELECT Id FROM Widget__c]; } }",
+        encoding="utf-8")
+    result = extract_sf(tmp_path)
+    by_id = {n["id"]: n for n in result["nodes"]}
+    assert "sf_stub" not in by_id[sobject_nid("Widget__c")]
+    assert "sf_stub" not in by_id[apex_nid("AService")]
+
+
+def test_apex_identity_ignores_keywords_in_comments(tmp_path: Path) -> None:
+    """A ``class``/``trigger`` word in a comment must not rename or re-type a class.
+
+    Real org: 212 Apex nodes were labelled ``for`` / ``Name`` / ``Handler`` and 53
+    classes were typed as triggers because the declaration regex read comments.
+    """
+    cls = tmp_path / "AI_AgentService.cls"
+    cls.write_text(
+        "/**\n * Helper class for agents. Handles the trigger Name mapping.\n */\n"
+        "public with sharing class AI_AgentService {\n"
+        "    // returns 'class Foo' style strings\n"
+        "    public static String describe() { return 'trigger X on Y'; }\n"
+        "}\n", encoding="utf-8")
+    result = extract_apex_enhanced(cls)
+    node = result["nodes"][0]
+    assert node["id"] == apex_nid("AI_AgentService")
+    assert node["label"] == "AI_AgentService"
+    assert node["sf_code_type"] == "class"
+    assert not any(e["relation"] == "triggers_on" for e in result["edges"])
+
+
+def test_apex_node_carries_no_source_text() -> None:
+    """The extracted graph keeps structure only — never the Apex source text."""
+    result = extract_sf(SAMPLE_ORG)
+    code = [n for n in result["nodes"] if n.get("sf_code_type") in ("class", "trigger")]
+    assert code
+    for node in code:
+        assert "source" not in node and "_source" not in node
+        assert node["sf_loc"] > 0
+        assert len(node["sf_source_hash"]) == 16
+
+
+def test_managed_hidden_class_is_kept_as_node(tmp_path: Path) -> None:
+    cls = tmp_path / "SSFLOW__CleanUpHelper.cls"
+    cls.write_text("(hidden)", encoding="utf-8")
+    result = extract_apex_enhanced(cls)
+    assert "error" not in result
+    node = result["nodes"][0]
+    assert node["id"] == apex_nid("SSFLOW__CleanUpHelper")
+    assert node["sf_managed_hidden"] is True
+    assert result["edges"] == []
+
+
+def test_trigger_emits_triggers_on_with_events(tmp_path: Path) -> None:
+    trig = tmp_path / "OppTrigger.trigger"
+    trig.write_text(
+        "trigger OppTrigger on Opportunity (before insert, after   update) {\n}\n",
+        encoding="utf-8")
+    result = extract_apex_enhanced(trig)
+    edge = next(e for e in result["edges"] if e["relation"] == "triggers_on")
+    assert edge["source"] == apex_nid("OppTrigger")
+    assert edge["target"] == sobject_nid("Opportunity")
+    assert edge["sf_trigger_events"] == ["before insert", "after update"]
+    _assert_no_dangling_edges(result)
+
+
+def test_apex_overloads_share_one_method_node(tmp_path: Path) -> None:
+    cls = tmp_path / "Calc.cls"
+    cls.write_text(
+        "public class Calc {\n"
+        "  public Integer add(Integer a) { return a; }\n"
+        "  public Integer add(Integer a, Integer b) { return a + b; }\n"
+        "}\n", encoding="utf-8")
+    result = extract_apex_enhanced(cls)
+    methods = [n for n in result["nodes"] if n.get("sf_method_type") == "method"]
+    assert [m["id"] for m in methods] == [apex_method_nid("Calc", "add")]
+    assert methods[0]["sf_signatures"] == ["add(Integer a)", "add(Integer a, Integer b)"]
+    member = [e for e in result["edges"] if e["relation"] == "member_of"]
+    assert len(member) == 1
 
 
 def test_apex_parser() -> None:
@@ -117,17 +285,19 @@ def test_apex_parser() -> None:
     # class node + sf_code_type
     classes = [n for n in cls_result["nodes"] if n.get("sf_code_type") == "class"]
     assert len(classes) == 1
-    assert classes[0]["label"] == "AccountService"
+    assert classes[0]["label"] == "sf_AccountService"  # file name is the API name
 
     # method signatures parsed (getAccounts, updateAccount)
     methods = [n for n in cls_result["nodes"] if n.get("sf_method_type") == "method"]
     method_ids = {n["id"] for n in methods}
-    assert f"{classes[0]['id']}_getaccounts" in method_ids
-    assert f"{classes[0]['id']}_updateaccount" in method_ids
-    # each method -> class via calls edge
-    calls = [e for e in cls_result["edges"] if e["relation"] == "calls"]
-    assert all(e["target"] == classes[0]["id"] for e in calls)
-    assert len(calls) == len(methods)
+    assert classes[0]["id"] == apex_nid("sf_AccountService")
+    assert apex_method_nid("sf_AccountService", "getAccounts") in method_ids
+    assert apex_method_nid("sf_AccountService", "updateAccount") in method_ids
+    # each method -> class via member_of (ownership, not a call)
+    member_of = [e for e in cls_result["edges"] if e["relation"] == "member_of"]
+    assert all(e["target"] == classes[0]["id"] for e in member_of)
+    assert len(member_of) == len(methods)
+    assert not any(e["relation"] == "calls" for e in cls_result["edges"])
 
     # 3. SOQL detected (FROM Account), CRITICAL: target uses sobject_nid()
     cls_queries = [e for e in cls_result["edges"] if e["relation"] == "queries"]
@@ -173,7 +343,7 @@ def test_apex_soql_relationship_subquery_not_sobject(tmp_path: Path) -> None:
 
     triggers = [n for n in trig_result["nodes"] if n.get("sf_code_type") == "trigger"]
     assert len(triggers) == 1
-    assert triggers[0]["label"] == "AccountTrigger"
+    assert triggers[0]["label"] == "sf_AccountTrigger"
 
     # 5. SOQL inside the loop is tagged sf_in_loop: true
     trig_queries = [e for e in trig_result["edges"] if e["relation"] == "queries"]
@@ -275,7 +445,8 @@ def test_lwc_parser() -> None:
     lwc_nodes = [n for n in js_result["nodes"] if n["file_type"] == "lwc_component"]
     assert len(lwc_nodes) == 1
     lwc_node = lwc_nodes[0]
-    assert lwc_node["label"] == "MyComponent"
+    assert lwc_node["label"] == "sf_MyComponent"  # bundle name, not the JS class
+    assert lwc_node["sf_js_class"] == "MyComponent"
     assert lwc_node["sf_lwc_file_type"] == "js"
 
     # 4. @api properties detected
@@ -288,9 +459,8 @@ def test_lwc_parser() -> None:
     assert len(wire_edges) == 1
     w = wire_edges[0]
     assert w["source"] == lwc_node["id"]
-    # Resolves to the same Apex method node ID the Apex parser produces:
-    # apex_<class>_<method>  (AccountService.getAccounts)
-    assert w["target"] == "apex_accountservice_getaccounts"
+    # Resolves to the same Apex method node ID the Apex parser produces.
+    assert w["target"] == apex_method_nid("AccountService", "getAccounts")
     assert w["sf_wire_method"] == "getAccounts"
     assert w["confidence"] == "INFERRED"
 
@@ -300,7 +470,7 @@ def test_lwc_parser() -> None:
     calls = [e for e in js_result["edges"] if e["relation"] == "lwc_calls"]
     assert len(calls) == 1
     assert calls[0]["source"] == lwc_node["id"]
-    assert calls[0]["target"] == "apex_accountservice_saveaccount"
+    assert calls[0]["target"] == apex_method_nid("AccountService", "saveAccount")
     assert calls[0]["sf_apex_method"] == "saveAccount"
 
 
@@ -418,70 +588,41 @@ def test_flow_parser_xml_parse_error(tmp_path: Path) -> None:
 
 
 def test_cpq_analysis() -> None:
-    """CPQ analysis pass: reclassify SBQQ__, detect QCP, order applies-to edges."""
-    # Parse the QCP plugin -> a "code" node carrying its source (QCP detection input).
+    """CPQ analysis pass: tag SBQQ__ metadata, detect QCP, order applies-to edges."""
+    # Parse the QCP plugin -> a "code" node carrying its transient _source.
     qcp_result = extract_apex_enhanced(FIXTURES / "sf_QCPPlugin.cls")
     assert "error" not in qcp_result
 
     all_nodes: list[dict] = list(qcp_result["nodes"])
     all_edges: list[dict] = list(qcp_result["edges"])
-    qcp_class_id = "apex_sf_qcpplugin"
+    qcp_class_id = apex_nid("sf_QCPPlugin")
 
-    # CPQ rule nodes (labels carry the SBQQ__ prefix) + a plain SObject that must
-    # NOT be reclassified.
-    all_nodes.append(
-        {
-            "id": "cpq_price_rule",
-            "label": "SBQQ__PriceRule__c Discount",
-            "file_type": "sobject",
-            "source_file": "objects/SBQQ__PriceRule__c.object-meta.xml",
-        }
-    )
-    all_nodes.append(
-        {
-            "id": "cpq_product_rule",
-            "label": "SBQQ__ProductRule__c Bundle",
-            "file_type": "sobject",
-            "source_file": "objects/SBQQ__ProductRule__c.object-meta.xml",
-        }
-    )
+    # Real CPQ rules (as the CPQ data ingester emits them) + SBQQ__ metadata.
+    all_nodes.append({"id": "cpq_price_rule", "label": "Discount",
+                      "file_type": "cpq_rule", "sf_cpq_rule_type": "Price",
+                      "source_file": "cpq_data"})
+    all_nodes.append({"id": "cpq_product_rule", "label": "Bundle",
+                      "file_type": "cpq_rule", "sf_cpq_rule_type": "Product",
+                      "source_file": "cpq_data"})
     quote_id = sobject_nid("SBQQ__Quote__c")
-    all_nodes.append(
-        {
-            "id": quote_id,
-            "label": "SBQQ__Quote__c",
-            "file_type": "sobject",
-            "source_file": "objects/SBQQ__Quote__c.object-meta.xml",
-        }
-    )
+    all_nodes.append({"id": quote_id, "label": "SBQQ__Quote__c", "file_type": "sobject",
+                      "sf_api_name": "SBQQ__Quote__c",
+                      "source_file": "objects/SBQQ__Quote__c.object-meta.xml"})
+    all_nodes.append({"id": field_nid("Account", "SBQQ__Renewal__c"),
+                      "label": "Account.SBQQ__Renewal__c", "file_type": "field",
+                      "sf_api_name": "SBQQ__Renewal__c", "sf_object": "Account"})
     account_id = sobject_nid("Account")
-    all_nodes.append(
-        {
-            "id": account_id,
-            "label": "Account",
-            "file_type": "sobject",
-            "source_file": "objects/Account.object-meta.xml",
-        }
-    )
+    all_nodes.append({"id": account_id, "label": "Account", "file_type": "sobject",
+                      "sf_api_name": "Account",
+                      "source_file": "objects/Account.object-meta.xml"})
+    # An Apex method whose *signature* mentions SBQQ__Quote__c is still code.
+    all_nodes.append({"id": "apex_x.clone", "label": "X.clone", "file_type": "code",
+                      "sf_signatures": ["clone(SBQQ__Quote__c q)"]})
 
-    all_edges.append(
-        {
-            "source": "cpq_price_rule",
-            "target": quote_id,
-            "relation": "cpq_applies_to",
-            "confidence": "INFERRED",
-            "source_file": "x",
-        }
-    )
-    all_edges.append(
-        {
-            "source": "cpq_product_rule",
-            "target": quote_id,
-            "relation": "cpq_applies_to",
-            "confidence": "INFERRED",
-            "source_file": "x",
-        }
-    )
+    for rule in ("cpq_price_rule", "cpq_product_rule"):
+        all_edges.append({"source": rule, "target": quote_id,
+                          "relation": "cpq_applies_to", "confidence": "INFERRED",
+                          "source_file": "x"})
 
     nodes_before = len(all_nodes)
     edges_before = len(all_edges)
@@ -498,13 +639,14 @@ def test_cpq_analysis() -> None:
 
     by_id = {n["id"]: n for n in all_nodes}
 
-    # 1. SBQQ__ nodes reclassified to cpq_rule
-    assert by_id["cpq_price_rule"]["file_type"] == "cpq_rule"
-    assert by_id["cpq_price_rule"]["sf_cpq_object"] == "SBQQ__PriceRule__c Discount"
-    assert by_id["cpq_product_rule"]["file_type"] == "cpq_rule"
-    assert by_id[quote_id]["file_type"] == "cpq_rule"
-    # plain SObject untouched
-    assert by_id[account_id]["file_type"] == "sobject"
+    # 1. SBQQ__ metadata is tagged but keeps its type; nothing becomes a rule.
+    assert by_id[quote_id]["file_type"] == "sobject"
+    assert by_id[quote_id]["sf_cpq_managed"] is True
+    assert by_id[field_nid("Account", "SBQQ__Renewal__c")]["sf_cpq_managed"] is True
+    assert by_id["apex_x.clone"]["file_type"] == "code"
+    assert "sf_cpq_managed" not in by_id[account_id]
+    assert {n["id"] for n in all_nodes if n["file_type"] == "cpq_rule"} == {
+        "cpq_price_rule", "cpq_product_rule"}
 
     # 2. QCP interface implementation detected
     assert by_id[qcp_class_id]["sf_qcp_implementation"] is True
@@ -907,18 +1049,18 @@ def test_detect_recursive_triggers() -> None:
     all_nodes: list[dict] = [
         # Unguarded 2-cycle: A <-> B.
         {"id": "code_a", "label": "AccountTriggerHandlerA", "file_type": "code",
-         "sf_code_type": "class", "source": "void run() { B.go(); }"},
+         "sf_code_type": "class", "_source": "void run() { B.go(); }"},
         {"id": "code_b", "label": "ServiceB", "file_type": "code",
-         "sf_code_type": "class", "source": "void go() { A.run(); }"},
+         "sf_code_type": "class", "_source": "void go() { A.run(); }"},
         # Guarded 2-cycle: C <-> D, where C uses a static Boolean flag.
         {"id": "code_c", "label": "ContactHandler", "file_type": "code",
          "sf_code_type": "class",
-         "source": "private static Boolean isRunning = false;"},
+         "_source": "private static Boolean isRunning = false;"},
         {"id": "code_d", "label": "ContactService", "file_type": "code",
-         "sf_code_type": "class", "source": "void touch() { C.run(); }"},
+         "sf_code_type": "class", "_source": "void touch() { C.run(); }"},
         # Acyclic edge -> never reported.
         {"id": "code_e", "label": "Leaf", "file_type": "code",
-         "sf_code_type": "class", "source": ""},
+         "sf_code_type": "class", "_source": ""},
     ]
     all_edges: list[dict] = [
         {"source": "code_a", "target": "code_b", "relation": "calls",
@@ -1131,7 +1273,7 @@ def test_cpq_qcp_field_writes_populate_target_fields() -> None:
     )
     nodes = [
         {"id": "apex_quotecalculator", "label": "QuoteCalculator",
-         "file_type": "code", "sf_code_type": "class", "source": qcp_source},
+         "file_type": "code", "sf_code_type": "class", "_source": qcp_source},
     ]
     cpq_analysis_pass(nodes, [])
 
@@ -1295,6 +1437,71 @@ def test_cpq_data_parser() -> None:
     ids = set(nodes)
     for e in result["edges"]:
         assert e["source"] in ids and e["target"] in ids
+
+
+def test_cpq_data_qualifies_fields_and_rule_objects(tmp_path: Path) -> None:
+    """CPQ picklist objects ("Quote Line") qualify field IDs and the rule target.
+
+    Real org: rules "applied to" Always / Save / Load — evaluation-event picklist
+    values — because the ingester fell back to SBQQ__EvaluationEvent__c.
+    """
+    rule_dir = tmp_path / "SBQQ__PriceRule__c"
+    cond_dir = tmp_path / "SBQQ__PriceCondition__c"
+    act_dir = tmp_path / "SBQQ__PriceAction__c"
+    for d in (rule_dir, cond_dir, act_dir):
+        d.mkdir()
+    ref = [{"Name": "SBQQ__Rule__r", "ReferencedFields": {"GearsetExternalId__c": "R1"}}]
+    (rule_dir / "r.gs.json").write_text(json.dumps({
+        "Object": "SBQQ__PriceRule__c",
+        "Fields": {"GearsetExternalId__c": "R1", "Name": "Line Discount",
+                   "SBQQ__EvaluationEvent__c": "Always"}}), encoding="utf-8")
+    (cond_dir / "c.gs.json").write_text(json.dumps({
+        "Object": "SBQQ__PriceCondition__c",
+        "Fields": {"GearsetExternalId__c": "C1", "SBQQ__Object__c": "Quote",
+                   "SBQQ__Field__c": "Region__c"}, "References": ref}), encoding="utf-8")
+    (act_dir / "a.gs.json").write_text(json.dumps({
+        "Object": "SBQQ__PriceAction__c",
+        "Fields": {"GearsetExternalId__c": "A1", "SBQQ__TargetObject__c": "Quote Line",
+                   "SBQQ__Field__c": "SBQQ__Discount__c"}, "References": ref}), encoding="utf-8")
+
+    result = extract_cpq_data(tmp_path)
+    ids = {n["id"] for n in result["nodes"]}
+    assert field_nid("SBQQ__Quote__c", "Region__c") in ids
+    assert field_nid("SBQQ__QuoteLine__c", "SBQQ__Discount__c") in ids
+    applies = next(e for e in result["edges"] if e["relation"] == "cpq_applies_to")
+    assert applies["target"] == sobject_nid("SBQQ__QuoteLine__c")  # the action's object
+    rule = next(n for n in result["nodes"] if n["id"] == "cpq_rule_r1")
+    assert rule["sf_evaluation_event"] == "Always"
+    assert not any(n["id"] == sobject_nid("Always") for n in result["nodes"])
+
+
+def test_unqualified_field_reference_resolves_to_unique_definition(tmp_path: Path) -> None:
+    """A field named without its object binds to the one defined field of that name."""
+    f = tmp_path / "objects" / "Account" / "fields" / "Region__c.field-meta.xml"
+    f.parent.mkdir(parents=True)
+    f.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <fullName>Region__c</fullName><type>Text</type>\n"
+        "</CustomField>\n", encoding="utf-8")
+    cpq = tmp_path / "cpq" / "SBQQ__PriceCondition__c"
+    cpq.mkdir(parents=True)
+    (cpq.parent / "SBQQ__PriceRule__c").mkdir()
+    (cpq.parent / "SBQQ__PriceRule__c" / "r.gs.json").write_text(json.dumps({
+        "Object": "SBQQ__PriceRule__c", "Fields": {"GearsetExternalId__c": "R1"}}),
+        encoding="utf-8")
+    (cpq / "c.gs.json").write_text(json.dumps({
+        "Object": "SBQQ__PriceCondition__c",
+        "Fields": {"GearsetExternalId__c": "C1", "SBQQ__Field__c": "Region__c"},
+        "References": [{"Name": "SBQQ__Rule__r",
+                        "ReferencedFields": {"GearsetExternalId__c": "R1"}}]}),
+        encoding="utf-8")
+
+    result = extract_sf(tmp_path / "objects", cpq_data_dir=tmp_path / "cpq")
+    _assert_no_dangling_edges(result)
+    reads = next(e for e in result["edges"] if e["relation"] == "cpq_reads_field")
+    assert reads["target"] == field_nid("Account", "Region__c")
+    assert not any(n["id"].startswith("field_?.") for n in result["nodes"])
 
 
 def test_cpq_data_gearset_format(tmp_path: Path) -> None:
@@ -1518,7 +1725,6 @@ def test_custom_labels_parser() -> None:
 def test_mdt_mapping_pass_separated_form() -> None:
     """Real-org Main/Second __mdt record -> directed maps_to field edge (Opp->Quote)."""
     from graphify.salesforce.mdt_mapping import mdt_mapping_pass
-    from graphify.salesforce.objects import _field_nid
 
     record = {
         "id": "cmt_opportunity_to_quote_mapping_rdd", "label": "RDD",
@@ -1537,8 +1743,8 @@ def test_mdt_mapping_pass_separated_form() -> None:
     assert len(new) == 1
     edge = new[0]
     # Direction: Main (source) -> Second (target).
-    assert edge["source"] == _field_nid("RequestedDeliveryDate__c")
-    assert edge["target"] == _field_nid("Requested_Delivery_Date__c")
+    assert edge["source"] == field_nid("Opportunity", "RequestedDeliveryDate__c")
+    assert edge["target"] == field_nid("SBQQ__Quote__c", "Requested_Delivery_Date__c")
     assert edge["relation"] == "maps_to"
     assert edge["confidence"] == "INFERRED"
     assert edge["sf_source_object"] == "Opportunity"
@@ -1553,7 +1759,6 @@ def test_mdt_mapping_pass_dotted_form() -> None:
     """Dotted Object.Field values with source/target key hints -> directed edge."""
     from graphify.salesforce.metadata import extract_custom_metadata_record
     from graphify.salesforce.mdt_mapping import mdt_mapping_pass
-    from graphify.salesforce.objects import _field_nid
 
     parsed = extract_custom_metadata_record(
         FIXTURES / "sf_OppToQuoteMapping.Default.md-meta.xml")
@@ -1562,8 +1767,8 @@ def test_mdt_mapping_pass_dotted_form() -> None:
     new = mdt_mapping_pass(nodes, edges)
     maps = [e for e in new if e["relation"] == "maps_to"]
     assert len(maps) == 1
-    assert maps[0]["source"] == _field_nid("Amount")
-    assert maps[0]["target"] == _field_nid("SBQQ__NetAmount__c")
+    assert maps[0]["source"] == field_nid("Opportunity", "Amount")
+    assert maps[0]["target"] == field_nid("SBQQ__Quote__c", "SBQQ__NetAmount__c")
     assert maps[0]["confidence"] == "INFERRED"
 
 

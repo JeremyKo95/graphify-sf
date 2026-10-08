@@ -121,8 +121,10 @@ def _parser_for(path: Path):
     if suffix in (".cls", ".trigger"):
         return extract_apex_enhanced
 
-    # LWC HTML/JS only — guard on an lwc/ directory in the path.
-    is_lwc = "lwc" in {p.lower() for p in path.parts[:-1]}
+    # LWC HTML/JS only — guard on an lwc/ directory in the path; Jest specs
+    # under __tests__ are not component code.
+    parts = {p.lower() for p in path.parts[:-1]}
+    is_lwc = "lwc" in parts and "__tests__" not in parts
     if is_lwc and suffix == ".html":
         return extract_lwc_html
     if is_lwc and suffix == ".js":
@@ -134,21 +136,72 @@ def _parser_for(path: Path):
 def _merge_into(all_nodes, node_by_id, node):
     """Merge ``node`` into the accumulated node list, deduping by ``id``.
 
-    First occurrence wins for the ``id`` / ``label`` (ADR-012); subsequent nodes
-    with the same ID only fill in attributes the existing node is missing. This
-    is what lets a full SObject node (from the Object parser) and a stub SObject
-    node (from an Apex SOQL ``FROM`` clause) collapse into a single node.
+    A definition (no ``sf_stub``) beats a stub: whichever parser defines the
+    entity supplies its label / ``source_file`` / attributes, even when a stub
+    emitted by a referencing file (an Apex ``FROM Account``) was seen first.
+    Otherwise the first occurrence wins (ADR-012) and later nodes only fill in
+    attributes the existing node is missing.
     """
     existing = node_by_id.get(node["id"])
     if existing is None:
         node_by_id[node["id"]] = node
         all_nodes.append(node)
         return
+    if existing.get("sf_stub") and not node.get("sf_stub"):
+        stub_attrs = dict(existing)
+        existing.clear()
+        existing.update(node)
+        for key, value in stub_attrs.items():
+            if key not in existing and key != "sf_stub":
+                existing[key] = value
+        return
     for key, value in node.items():
-        if key in ("id", "label"):
+        if key in ("id", "label") or (key == "sf_stub" and not existing.get("sf_stub")):
             continue
         if existing.get(key) in (None, "", []) and value not in (None, "", []):
             existing[key] = value
+
+
+def _resolve_unqualified_fields(all_nodes, all_edges):
+    """Rewire object-less field stubs (``field_?.<name>``) to a defined field.
+
+    CPQ conditions and ``__mdt`` mappings sometimes name a field without its
+    object. When exactly one defined field in the repo carries that API name the
+    stub is replaced by it; otherwise the stub stays, flagged ``sf_unresolved``
+    with ``sf_candidate_count`` so the ambiguity is visible, never guessed.
+    """
+    defined: dict[str, list[str]] = {}
+    for node in all_nodes:
+        if node.get("file_type") == "field" and node.get("sf_object") and not node.get("sf_stub"):
+            defined.setdefault(node["sf_api_name"].lower(), []).append(node["id"])
+
+    rewired: dict[str, str] = {}
+    for node in all_nodes:
+        if node.get("file_type") != "field" or node.get("sf_object"):
+            continue
+        candidates = defined.get(str(node.get("sf_api_name", "")).lower(), [])
+        if len(candidates) == 1:
+            rewired[node["id"]] = candidates[0]
+        else:
+            node["sf_candidate_count"] = len(candidates)
+
+    if not rewired:
+        return
+    for edge in all_edges:
+        edge["source"] = rewired.get(edge["source"], edge["source"])
+        edge["target"] = rewired.get(edge["target"], edge["target"])
+    all_nodes[:] = [n for n in all_nodes if n["id"] not in rewired]
+
+
+def _drop_transient_attrs(all_nodes):
+    """Remove ``_``-prefixed working attributes (e.g. Apex ``_source``).
+
+    They exist only so analysis passes can read parser state; the graph carries
+    structure, never source code.
+    """
+    for node in all_nodes:
+        for key in [k for k in node if k.startswith("_")]:
+            del node[key]
 
 
 def _merge_lwc_components(all_nodes, all_edges):
@@ -272,6 +325,7 @@ def extract_sf(path, *, cpq_data_dir=None, **kwargs):
     cpq_analysis_pass(all_nodes, all_edges)
     _merge_lwc_components(all_nodes, all_edges)
     mdt_mapping_pass(all_nodes, all_edges)
+    _resolve_unqualified_fields(all_nodes, all_edges)
     ooe_analysis_pass(all_nodes, all_edges)
     all_edges.extend(governor_limit_analysis_pass(all_nodes, all_edges))
     all_edges.extend(detect_recursive_triggers(all_nodes, all_edges))
@@ -279,4 +333,5 @@ def extract_sf(path, *, cpq_data_dir=None, **kwargs):
     all_edges.extend(detect_flow_cpq_loops(all_nodes, all_edges))
     all_edges.extend(validation_cpq_analysis_pass(all_nodes, all_edges))
 
+    _drop_transient_attrs(all_nodes)
     return {"nodes": all_nodes, "edges": all_edges}

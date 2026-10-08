@@ -23,8 +23,8 @@ import json
 import re
 from pathlib import Path
 
-from graphify.salesforce.constants import sobject_nid
-from graphify.salesforce.objects import _field_nid
+from graphify.salesforce.constants import sobject_stub
+from graphify.salesforce.objects import field_node
 
 #: SBQQ object → role in the graph.
 _RULE_OBJECTS = {"SBQQ__PriceRule__c", "SBQQ__ProductRule__c"}
@@ -32,6 +32,30 @@ _CONDITION_OBJECTS = {"SBQQ__PriceCondition__c", "SBQQ__ErrorCondition__c"}
 _ACTION_OBJECTS = {"SBQQ__PriceAction__c", "SBQQ__ProductAction__c"}
 #: QCP plugin implemented as a JavaScript Custom Script (not Apex).
 _SCRIPT_OBJECTS = {"SBQQ__CustomScript__c"}
+
+#: CPQ condition / action object picklist values -> SObject API names.
+_CPQ_OBJECT_PICKLIST = {
+    "quote": "SBQQ__Quote__c",
+    "quote line": "SBQQ__QuoteLine__c",
+    "quote line group": "SBQQ__QuoteLineGroup__c",
+    "product option": "SBQQ__ProductOption__c",
+    "configuration attributes": "SBQQ__ConfigurationAttribute__c",
+    "product": "Product2",
+}
+
+#: Object a rule applies to when none of its conditions / actions names one.
+_DEFAULT_RULE_OBJECT = "SBQQ__Quote__c"
+
+
+def _cpq_object(value) -> str | None:
+    """Map a CPQ object picklist value (``Quote Line``) to its API name."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    if " " not in value and ("__" in value or value[:1].isupper()):
+        return _CPQ_OBJECT_PICKLIST.get(value.lower(), value)
+    return _CPQ_OBJECT_PICKLIST.get(value.lower())
+
 
 #: QCP JavaScript API lifecycle hooks (Quote Calculator Plugin, JS flavour).
 _QCP_JS_METHODS = (
@@ -167,34 +191,39 @@ def extract_cpq_data(data_dir: Path | str) -> dict:
     edges: list[dict] = []
     node_ids: set[str] = set()
     target_fields: dict[str, list[str]] = {}  # rule_id -> [field api names]
+    # rule_id -> objects its actions write / conditions test (actions first).
+    rule_objects: dict[str, list[str]] = {}
 
-    def _ensure_field_node(field_api: str, source_file: str) -> str:
-        fid = _field_nid(field_api)
-        if fid not in node_ids:
-            nodes.append({
-                "id": fid, "label": field_api, "file_type": "field",
-                "source_file": source_file, "sf_api_name": field_api,
-            })
-            node_ids.add(fid)
-        return fid
+    def _ensure_field_node(field_api: str, object_api: str | None) -> str:
+        node = field_node(object_api, field_api, "cpq_data", sf_stub=True)
+        if node["id"] not in node_ids:
+            nodes.append(node)
+            node_ids.add(node["id"])
+        return node["id"]
 
     # --- Conditions (read fields) -------------------------------------------
     for obj_type, rec in conditions:
         cid = _node_id("cpq_condition", rec["Id"])
         field = rec.get("SBQQ__Field__c") or rec.get("SBQQ__TestedField__c")
+        field_object = _cpq_object(
+            rec.get("SBQQ__Object__c") or rec.get("SBQQ__TestedObject__c")
+        )
         nodes.append({
             "id": cid, "label": rec.get("Name") or cid, "file_type": "cpq_condition",
             "source_file": "cpq_data", "sf_cpq_object": obj_type,
-            "sf_field": field, "sf_operator": rec.get("SBQQ__Operator__c"),
+            "sf_field": field, "sf_field_object": field_object,
+            "sf_operator": rec.get("SBQQ__Operator__c"),
         })
         node_ids.add(cid)
         rule_id = rec.get("SBQQ__Rule__c")
+        if rule_id and field_object:
+            rule_objects.setdefault(rule_id, []).append(field_object)
         if rule_id:
             edges.append({"source": _rule_nid(rule_id), "target": cid,
                           "relation": "cpq_has_condition", "confidence": "EXTRACTED",
                           "source_file": "cpq_data"})
         if field:
-            edges.append({"source": cid, "target": _ensure_field_node(field, "cpq_data"),
+            edges.append({"source": cid, "target": _ensure_field_node(field, field_object),
                           "relation": "cpq_reads_field", "confidence": "EXTRACTED",
                           "source_file": "cpq_data"})
 
@@ -202,13 +231,18 @@ def extract_cpq_data(data_dir: Path | str) -> dict:
     for obj_type, rec in actions:
         aid = _node_id("cpq_action", rec["Id"])
         field = rec.get("SBQQ__TargetField__c")
+        field_object = _cpq_object(rec.get("SBQQ__TargetObject__c"))
         nodes.append({
             "id": aid, "label": rec.get("Name") or aid, "file_type": "cpq_action",
             "source_file": "cpq_data", "sf_cpq_object": obj_type,
-            "sf_target_field": field, "sf_formula": rec.get("SBQQ__Formula__c"),
+            "sf_target_field": field, "sf_field_object": field_object,
+            "sf_formula": rec.get("SBQQ__Formula__c"),
         })
         node_ids.add(aid)
         rule_id = rec.get("SBQQ__Rule__c")
+        if rule_id and field_object:
+            # Actions name the object the rule really changes: put them first.
+            rule_objects.setdefault(rule_id, []).insert(0, field_object)
         if rule_id:
             edges.append({"source": _rule_nid(rule_id), "target": aid,
                           "relation": "cpq_has_action", "confidence": "EXTRACTED",
@@ -216,7 +250,7 @@ def extract_cpq_data(data_dir: Path | str) -> dict:
             if field:
                 target_fields.setdefault(rule_id, []).append(field)
         if field:
-            edges.append({"source": aid, "target": _ensure_field_node(field, "cpq_data"),
+            edges.append({"source": aid, "target": _ensure_field_node(field, field_object),
                           "relation": "cpq_writes_field", "confidence": "EXTRACTED",
                           "source_file": "cpq_data"})
 
@@ -224,11 +258,11 @@ def extract_cpq_data(data_dir: Path | str) -> dict:
     for rec_id, rec in rules.items():
         rid = _rule_nid(rec_id)
         is_price = rule_types[rec_id] == "SBQQ__PriceRule__c"
-        applies_object = (
-            rec.get("SBQQ__LookupObject__c")
-            or rec.get("SBQQ__EvaluationEvent__c")
-            or "SBQQ__Quote__c"
-        )
+        # SBQQ__EvaluationEvent__c is a timing picklist (Always / Save / On
+        # Calculate) and SBQQ__LookupObject__c a lookup-table source; neither is
+        # the object the rule applies to, so both are kept as attributes only.
+        objects = rule_objects.get(rec_id) or [_DEFAULT_RULE_OBJECT]
+        applies_object = objects[0]
         eval_order = _num(rec.get("SBQQ__EvaluationOrder__c"))  # Gearset stores "50.0" as str
         fields = sorted(set(target_fields.get(rec_id, [])))
         node = {
@@ -236,6 +270,8 @@ def extract_cpq_data(data_dir: Path | str) -> dict:
             "source_file": "cpq_data", "sf_cpq_object": applies_object,
             "sf_cpq_rule_type": "Price" if is_price else "Product",
             "sf_eval_order": eval_order,
+            "sf_evaluation_event": rec.get("SBQQ__EvaluationEvent__c"),
+            "sf_lookup_object": rec.get("SBQQ__LookupObject__c"),
         }
         if fields:
             node["sf_target_fields"] = fields
@@ -243,12 +279,10 @@ def extract_cpq_data(data_dir: Path | str) -> dict:
         node_ids.add(rid)
 
         # rule -> object it applies to (feeds sf_cpq_chain; execution_order req'd).
-        obj_token = applies_object if "SBQQ__" in applies_object else applies_object
-        target_obj = sobject_nid(obj_token)
+        stub = sobject_stub(applies_object, "cpq_data")
+        target_obj = stub["id"]
         if target_obj not in node_ids:
-            nodes.append({"id": target_obj, "label": obj_token, "file_type": "sobject",
-                          "source_file": "cpq_data",
-                          "sf_object_type": "custom" if "__c" in obj_token else "standard"})
+            nodes.append(stub)
             node_ids.add(target_obj)
         edges.append({
             "source": rid, "target": target_obj, "relation": "cpq_applies_to",

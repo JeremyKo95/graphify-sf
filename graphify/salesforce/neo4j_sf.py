@@ -47,6 +47,8 @@ SF_NODE_TYPE_TO_NEO4J_LABEL: dict[str, str] = {
 SF_RELATION_TO_NEO4J_TYPE: dict[str, str] = {
     # Apex
     "triggers_on": "TRIGGERS_ON",
+    "member_of": "MEMBER_OF",
+    "implements": "IMPLEMENTS",
     "queries": "QUERIES",
     "dml_operates_on": "DML_OPERATES_ON",
     # Flow

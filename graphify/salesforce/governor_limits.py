@@ -156,14 +156,14 @@ def _has_safe_recursion_marker(node: dict) -> bool:
     """Return True if *node* carries an intentional recursion-guard pattern.
 
     Honors an explicit ``sf_safe_recursion`` boolean first, then scans only the
-    node's Apex ``source`` (kept by apex_enhanced.py) for a known guard pattern.
+    node's transient Apex ``_source`` (set by apex_enhanced.py) for a known guard pattern.
     The class *name* / label is deliberately NOT scanned: a class merely named
     ``…TriggerHandler`` is not itself a guard, so matching on it would be a false
     positive (ADR-027).
     """
     if node.get("sf_safe_recursion"):
         return True
-    source = node.get("source", "")
+    source = node.get("_source", "")
     return isinstance(source, str) and any(
         pat.search(source) for pat in _SAFE_RECURSION_PATTERNS
     )

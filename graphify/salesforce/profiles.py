@@ -31,7 +31,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from graphify.salesforce.constants import sobject_nid
+from graphify.salesforce.constants import apex_nid, sobject_nid, sobject_stub
 
 #: Salesforce metadata XML namespace.
 _NS = {"md": "http://soap.sforce.com/2006/04/metadata"}
@@ -86,12 +86,16 @@ def _ensure_stub_node(
     """
     if any(n["id"] == node_id for n in nodes):
         return
+    if file_type == "sobject":
+        nodes.append(sobject_stub(label, path))
+        return
     nodes.append(
         {
             "id": node_id,
             "label": label,
             "file_type": file_type,
             "source_file": str(path),
+            "sf_stub": True,
         }
     )
 
@@ -166,8 +170,7 @@ def extract_profile(path: Path) -> dict:
         enabled = class_access.findtext("md:enabled", namespaces=_NS) == "true"
         if not apex_class or not enabled:
             continue
-        # Matches the Apex/Flow parsers' class node ID (apex_<class>).
-        apex_id = f"apex_{apex_class.lower()}"
+        apex_id = apex_nid(apex_class)
         _ensure_stub_node(nodes, apex_id, apex_class, "code", path)
         edges.append(
             {

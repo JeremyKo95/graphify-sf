@@ -36,7 +36,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from graphify.salesforce.constants import sobject_nid
+from graphify.salesforce.constants import apex_nid, sobject_stub
 
 #: Salesforce metadata XML namespace.
 _NS = {"md": "http://soap.sforce.com/2006/04/metadata"}
@@ -47,16 +47,6 @@ _DML_TYPE_BY_ELEMENT = {
     "recordUpdates": "UPDATE",
     "recordDeletes": "DELETE",
 }
-
-
-def _apex_nid(class_name: str) -> str:
-    """Build a node ID for an Apex class referenced from a Flow apexAction.
-
-    Matches the convention shared with the LWC / Apex parsers
-    (``apex_<lowercased-class-name>``) so ``flow_invokes`` edges resolve to the
-    same Apex node in ``build_graph()``.
-    """
-    return f"apex_{class_name.lower()}"
 
 
 def _flow_name(path: Path) -> str:
@@ -135,6 +125,7 @@ def extract_flow(path: Path) -> dict:
             "label": flow_name,
             "file_type": "flow",
             "source_file": str(path),
+            "sf_qualified_name": flow_name,
             "sf_trigger_object": trigger_object,
             "sf_trigger_type": trigger_type,
         }
@@ -152,18 +143,9 @@ def extract_flow(path: Path) -> dict:
             variables[var_name] = obj_type
 
     def _add_sobject_stub(object_api: str) -> str:
-        target_id = sobject_nid(object_api)
-        _ensure_node(
-            nodes,
-            {
-                "id": target_id,
-                "label": object_api,
-                "file_type": "sobject",
-                "source_file": str(path),
-                "sf_object_type": "custom" if "__c" in object_api else "standard",
-            },
-        )
-        return target_id
+        node = sobject_stub(object_api, path)
+        _ensure_node(nodes, node)
+        return node["id"]
 
     def _resolve_object(elem) -> str | None:
         """Object an element targets: direct ``<object>`` or a variable's type."""
@@ -175,6 +157,19 @@ def extract_flow(path: Path) -> dict:
             # inputReference may be "Var" or "Var.field"; resolve the root var.
             return variables.get(ref.split(".")[0])
         return None
+
+    # 1b. Record-triggered flow -> triggers_on its object (runs in its OoE).
+    if trigger_object and trigger_type:
+        edges.append(
+            {
+                "source": flow_id,
+                "target": _add_sobject_stub(trigger_object),
+                "relation": "triggers_on",
+                "confidence": "EXTRACTED",
+                "source_file": str(path),
+                "sf_trigger_type": trigger_type,
+            }
+        )
 
     # 2a. recordLookups -> queries (SOQL site)
     for elem in root.findall("md:recordLookups", namespaces=_NS):
@@ -217,7 +212,7 @@ def extract_flow(path: Path) -> dict:
         action_name = elem.findtext("md:actionName", namespaces=_NS)
         if not action_name:
             continue
-        apex_id = _apex_nid(action_name)
+        apex_id = apex_nid(action_name)
         _ensure_node(
             nodes,
             {
@@ -225,6 +220,7 @@ def extract_flow(path: Path) -> dict:
                 "label": action_name,
                 "file_type": "code",
                 "source_file": str(path),
+                "sf_stub": True,
             },
         )
         edges.append(

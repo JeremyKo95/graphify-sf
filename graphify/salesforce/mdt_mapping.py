@@ -32,18 +32,14 @@ from __future__ import annotations
 
 import re
 
+from graphify.salesforce.objects import field_node
+
 #: A value shaped like ``Object.Field`` (single dot, identifier on each side).
 _DOTTED_RE = re.compile(r"^[A-Za-z][\w]*\.[A-Za-z][\w]*$")
 
 #: Role hint tokens (matched as whole ``_``-separated tokens, not substrings).
 _SOURCE_HINTS = frozenset({"main", "source", "from", "first", "primary", "origin", "src"})
 _TARGET_HINTS = frozenset({"second", "target", "to", "dest", "destination", "result"})
-
-
-def _field_nid(api_name: str) -> str:
-    """Mirror ``objects._field_nid`` so resolved fields merge with parsed ones."""
-    normalized = api_name.lower().replace("__c", "").replace("__", "_")
-    return f"field_{normalized}"
 
 
 def _norm_key(key: str) -> str:
@@ -96,20 +92,12 @@ def _refs_from_values(values: dict) -> list[tuple[str | None, str | None, str]]:
     return refs
 
 
-def _ensure_field(nodes, by_id, fid, api, obj, record) -> None:
-    if fid in by_id:
-        node = by_id[fid]
-        if obj and not node.get("sf_object"):
-            node["sf_object"] = obj
-        return
-    node = {
-        "id": fid, "label": api, "file_type": "field",
-        "source_file": record.get("source_file", ""), "sf_api_name": api,
-    }
-    if obj:
-        node["sf_object"] = obj
-    nodes.append(node)
-    by_id[fid] = node
+def _ensure_field(nodes, by_id, api, obj, record) -> str:
+    node = field_node(obj, api, record.get("source_file", ""), sf_stub=True)
+    if node["id"] not in by_id:
+        nodes.append(node)
+        by_id[node["id"]] = node
+    return node["id"]
 
 
 def mdt_mapping_pass(nodes: list[dict], edges: list[dict]) -> list[dict]:
@@ -142,11 +130,10 @@ def mdt_mapping_pass(nodes: list[dict], edges: list[dict]) -> list[dict]:
                 pairs.append((refs[0], t, "AMBIGUOUS"))
 
         for (_, sobj, sfld), (_, tobj, tfld), conf in pairs:
-            sid, tid = _field_nid(sfld), _field_nid(tfld)
-            if sid == tid:
+            if (sobj, sfld) == (tobj, tfld):
                 continue
-            _ensure_field(nodes, by_id, sid, sfld, sobj, record)
-            _ensure_field(nodes, by_id, tid, tfld, tobj, record)
+            sid = _ensure_field(nodes, by_id, sfld, sobj, record)
+            tid = _ensure_field(nodes, by_id, tfld, tobj, record)
             edge = {
                 "source": sid, "target": tid, "relation": "maps_to",
                 "confidence": conf, "source_file": record.get("source_file", ""),
