@@ -41,6 +41,17 @@ from networkx.readwrite import json_graph
 _PER_SITE_ATTRS = ("source_location", "sf_dml_type", "sf_flow_element", "source_file")
 
 
+#: Numeric value of a confidence label when an edge carries no explicit value.
+_CONFIDENCE_VALUE = {"EXTRACTED": 1.0, "INFERRED": 0.7, "AMBIGUOUS": 0.4}
+
+
+def _confidence(attrs: dict) -> float:
+    value = attrs.get("confidence_value")
+    if isinstance(value, (int, float)):
+        return float(value)
+    return _CONFIDENCE_VALUE.get(attrs.get("confidence", ""), 1.0)
+
+
 def _aggregate_edges(edges: list[dict], node_ids) -> dict[tuple, dict]:
     """Fold edges into one record per ``(source, target, relation)``.
 
@@ -71,9 +82,12 @@ def _aggregate_edges(edges: list[dict], node_ids) -> dict[tuple, dict]:
         first["sf_occurrences"] = first.get("sf_occurrences", 1) + 1
         if attrs.get("sf_in_loop"):
             first["sf_in_loop"] = True
-        if attrs.get("confidence_value", 1.0) > first.get("confidence_value", 1.0):
+        if _confidence(attrs) > _confidence(first):
             first["confidence"] = attrs.get("confidence", first.get("confidence"))
-            first["confidence_value"] = attrs["confidence_value"]
+            if "confidence_value" in attrs:
+                first["confidence_value"] = attrs["confidence_value"]
+            else:
+                first.pop("confidence_value", None)
 
     for key, attrs in grouped.items():
         for a, values in sites[key].items():

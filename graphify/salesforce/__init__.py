@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .constants import sobject_nid, sobject_stub
+
 
 def register():
     """Register Salesforce parsers with the main graphify pipeline.
@@ -228,6 +230,51 @@ def _relativize_paths(all_nodes, all_edges, base: Path):
             item["source_file"] = rel(item["source_file"])
 
 
+def _confirm_var_typed_dml(all_nodes, all_edges):
+    """Re-target DML edges whose object came only from a variable's declared type.
+
+    ``update rows;`` with ``List<RowWrapper> rows`` would otherwise invent an
+    SObject named after an Apex class (or ``Id`` / ``HttpResponse``). The type
+    is kept only when other evidence says it is an SObject — it is defined,
+    queried, triggered on, looked up or written by a Flow — and it is not an
+    Apex type; otherwise the edge points at the ``unknown`` SObject
+    (``sf_ambiguous``) and stubs left without edges are removed.
+    """
+    apex_types = {
+        str(n.get("label", "")).lower() for n in all_nodes
+        if n.get("sf_code_type") in ("class", "interface", "enum")
+    }
+    evidence = {n["id"] for n in all_nodes
+                if n.get("file_type") == "sobject" and not n.get("sf_stub")}
+    evidence |= {e["target"] for e in all_edges if not e.get("sf_var_typed")}
+    by_id = {n["id"]: n for n in all_nodes}
+
+    unknown = sobject_nid("unknown")
+    changed = False
+    for edge in all_edges:
+        if not edge.get("sf_var_typed"):
+            continue
+        label = str(by_id.get(edge["target"], {}).get("label", "")).lower()
+        if edge["target"] in evidence and label not in apex_types:
+            continue
+        edge["target"] = unknown
+        edge["sf_ambiguous"] = True
+        edge.pop("sf_var_typed")
+        changed = True
+    if not changed:
+        return
+    if unknown not in by_id:
+        stub = sobject_stub("unknown", "")
+        stub["sf_ambiguous"] = True
+        all_nodes.append(stub)
+    referenced = {e["source"] for e in all_edges} | {e["target"] for e in all_edges}
+    all_nodes[:] = [
+        n for n in all_nodes
+        if not (n.get("file_type") == "sobject" and n.get("sf_stub")
+                and n["id"] not in referenced)
+    ]
+
+
 def _drop_transient_attrs(all_nodes):
     """Remove ``_``-prefixed working attributes (e.g. Apex ``_source``).
 
@@ -374,6 +421,7 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
     _merge_lwc_components(all_nodes, all_edges)
     mdt_mapping_pass(all_nodes, all_edges)
     _resolve_unqualified_fields(all_nodes, all_edges)
+    _confirm_var_typed_dml(all_nodes, all_edges)
     resolve_field_refs(all_nodes, all_edges, field_refs)
     ooe_analysis_pass(all_nodes, all_edges)
     all_edges.extend(governor_limit_analysis_pass(all_nodes, all_edges))

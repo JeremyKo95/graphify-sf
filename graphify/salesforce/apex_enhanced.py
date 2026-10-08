@@ -38,6 +38,7 @@ import hashlib
 import re
 from pathlib import Path
 
+from graphify.salesforce.field_refs import field_ref
 from graphify.salesforce.constants import (
     CPQ_QCP_INTERFACE,
     apex_method_nid,
@@ -166,6 +167,92 @@ def strip_apex(source: str) -> tuple[str, list[tuple[int, str]]]:
             out.append(c)
             i += 1
     return "".join(out), strings
+
+
+#: Typed declarations (stripped code): ``List<Account> accs``, ``Set<Lead> s``,
+#: ``Map<Id, Contact> m``, ``Account[] arr``, ``Account a`` / parameters, and
+#: ``for (Opportunity o : ...)``. Captures (type, variable).
+_FIELD_DECL_RES = (
+    re.compile(r"\b(?:List|Set)\s*<\s*(\w+)\s*>\s+(\w+)\s*[=;,):]", re.IGNORECASE),
+    re.compile(r"\bMap\s*<\s*\w+\s*,\s*(\w+)\s*>\s+(\w+)\s*[=;,):]", re.IGNORECASE),
+    re.compile(r"\b(\w+)\s*\[\s*\]\s+(\w+)\s*[=;,):]"),
+    re.compile(r"\bfor\s*\(\s*(\w+)\s+(\w+)\s*:", re.IGNORECASE),
+    re.compile(r"\b([A-Za-z]\w*)\s+(\w+)\s*[=;,):]"),
+)
+
+#: ``var.Field`` / ``var.Rel.Field`` with an optional call / assignment after.
+_MEMBER_ACCESS_RE = re.compile(r"(?<![\w.])(\w+)\s*\.\s*(\w+)(?:\s*\.\s*(\w+))?(\s*\()?")
+
+#: ``new Account(Name = 'x', Tier__c = t)`` — constructor field writes.
+_SOBJECT_CTOR_RE = re.compile(r"\bnew\s+(\w+)\s*\(([^()]*)\)")
+
+#: Members that look like ``var.x`` but are not fields.
+_NON_FIELD_MEMBERS = frozenset({
+    "sobjecttype", "getsobjecttype", "fields", "getdescribe", "class", "fieldsets",
+    "size", "isempty", "keyset", "values", "add", "addall", "put", "get", "clear",
+    "contains", "containskey", "remove", "clone", "length", "tostring",
+})
+
+
+def _field_access_refs(code: str, class_id: str, path: Path) -> list[dict]:
+    """Field reads / writes through typed variables and SObject constructors.
+
+    The declared type is only a *candidate* SObject here; ``require_object``
+    lets the graph-wide resolver drop types that turn out to be Apex classes.
+    """
+    var_types: dict[str, str] = {}
+    for regex in _FIELD_DECL_RES:
+        for match in regex.finditer(code):
+            type_name, var = match.group(1), match.group(2)
+            if type_name not in _NON_SOBJECT_TYPES and type_name.lower() not in (
+                    "return", "new", "else", "throw"):
+                var_types.setdefault(var.lower(), type_name)
+
+    refs: list[dict] = []
+
+    def add(obj: str, field_path: str, relation: str, offset: int) -> None:
+        refs.append(field_ref(
+            class_id, obj, field_path, relation, path, confidence="INFERRED",
+            confidence_value=0.8, require_object=True,
+            source_location=f"L{code.count(chr(10), 0, offset) + 1}",
+        ))
+
+    for match in _MEMBER_ACCESS_RE.finditer(code):
+        var, first, second, call = match.groups()
+        obj = var_types.get(var.lower())
+        if obj is None or first.lower() in _NON_FIELD_MEMBERS:
+            continue
+        if call and not second:
+            continue  # var.method(...)
+        if second and call:
+            add(obj, first, "reads_field", match.start())  # var.Rel.method()
+            continue
+        field_path = f"{first}.{second}" if second else first
+        is_write = bool(re.match(r"\s*[+\-*/]?=(?!=)", code[match.end():match.end() + 4]))
+        add(obj, field_path, "writes_field" if is_write else "reads_field", match.start())
+
+    for match in _SOBJECT_CTOR_RE.finditer(code):
+        for assignment in re.finditer(r"(\w+)\s*=(?!=)", match.group(2)):
+            add(match.group(1), assignment.group(1), "writes_field", match.start())
+    return refs
+
+
+def _soql_field_refs(site: dict, class_id: str, path: Path) -> list[dict]:
+    """``reads_field`` references for a SOQL site's SELECT / WHERE fields and
+    one child reference per relationship subquery."""
+    soql = site["soql"]
+    attrs = {"source_location": f"L{site['line']}"}
+    if site["dynamic"]:
+        attrs.update(confidence="INFERRED", confidence_value=0.7, sf_dynamic=True)
+    else:
+        attrs["confidence"] = "EXTRACTED"
+    refs = [field_ref(class_id, soql["object"], field, "reads_field", path, **attrs)
+            for field in (*soql["select"], *soql["where"])]
+    for relationship, fields in soql["children"]:
+        refs.append({"source": class_id, "object": soql["object"], "child": relationship,
+                     "paths": fields, "source_file": str(path),
+                     "sf_in_loop": site["in_loop"], **attrs})
+    return refs
 
 
 def _find_loop_ranges(source: str) -> list[tuple[int, int]]:
@@ -320,22 +407,25 @@ def _detect_dml_operations(
 ) -> list[tuple[str, str, int, bool]]:
     """Detect DML statements in stripped *code*.
 
-    Returns ``(dml_type, sobject_name, line_no, in_loop)``. ``sobject_name`` is
-    resolved from variable-type tracking (or read from ``new <Type>(...)``), or
-    ``"unknown"`` when not inferable.
+    Returns ``(dml_type, sobject_name, line_no, in_loop, var_typed)``.
+    ``sobject_name`` is read from ``new <Type>(...)``, or resolved from
+    variable-type tracking (``var_typed`` — only a candidate until
+    ``extract_sf`` confirms it is an SObject), or ``"unknown"``.
     """
     loop_ranges = _find_loop_ranges(code)
-    found: list[tuple[int, str, str]] = []
+    found: list[tuple[int, str, str, bool]] = []
     for regex in (_DML_RE, _DATABASE_DML_RE):
         for match in regex.finditer(code):
-            found.append((match.start(), match.group(1).upper(),
-                          var_types.get(match.group(2), "unknown")))
+            sobject = var_types.get(match.group(2), "unknown")
+            found.append((match.start(), match.group(1).upper(), sobject,
+                          sobject != "unknown"))
     for match in _DML_NEW_RE.finditer(code):
-        found.append((match.start(), match.group(1).upper(), match.group(2)))
-    results: list[tuple[str, str, int, bool]] = []
-    for offset, dml_type, sobject in sorted(found):
+        found.append((match.start(), match.group(1).upper(), match.group(2), False))
+    results: list[tuple[str, str, int, bool, bool]] = []
+    for offset, dml_type, sobject, var_typed in sorted(found):
         line_no = code.count("\n", 0, offset) + 1
-        results.append((dml_type, sobject, line_no, _in_loop(line_no, loop_ranges)))
+        results.append((dml_type, sobject, line_no,
+                        _in_loop(line_no, loop_ranges), var_typed))
     return results
 
 
@@ -458,7 +548,9 @@ def extract_apex_enhanced(path: Path) -> dict:
     nodes.extend(methods.values())
 
     # 3. SOQL queries (cross-file resolution) -----------------------------
+    field_refs: list[dict] = []
     for site in _detect_soql(code, _strings):
+        field_refs.extend(_soql_field_refs(site, class_id, path))
         sobject_name = site["soql"]["object"]
         target_id = sobject_nid(sobject_name)
         _ensure_sobject_node(nodes, target_id, sobject_name, path)
@@ -479,7 +571,7 @@ def extract_apex_enhanced(path: Path) -> dict:
 
     # 4. DML operations ---------------------------------------------------
     var_types = _build_var_types(code)
-    for dml_type, sobject_name, line_no, in_loop in _detect_dml_operations(
+    for dml_type, sobject_name, line_no, in_loop, var_typed in _detect_dml_operations(
         code, var_types
     ):
         target_id = sobject_nid(sobject_name)
@@ -497,6 +589,8 @@ def extract_apex_enhanced(path: Path) -> dict:
         }
         if sobject_name == "unknown":
             edge["sf_ambiguous"] = True
+        elif var_typed:
+            edge["sf_var_typed"] = True
         edges.append(edge)
 
     # 5. Implements (QCP / Batchable hint) --------------------------------
@@ -530,4 +624,5 @@ def extract_apex_enhanced(path: Path) -> dict:
     if "implements Database.Batchable" in code:
         nodes[0]["sf_async_pattern"] = "batchable"
 
-    return {"nodes": nodes, "edges": edges}
+    field_refs.extend(_field_access_refs(code, class_id, path))
+    return {"nodes": nodes, "edges": edges, "field_refs": field_refs}

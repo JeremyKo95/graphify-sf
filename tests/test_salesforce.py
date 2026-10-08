@@ -480,6 +480,26 @@ def test_soql_semi_join_queries_second_object(tmp_path: Path) -> None:
     assert sorted(e["target"] for e in edges) == [sobject_nid("Contact"), sobject_nid("User")]
 
 
+def test_var_typed_dml_needs_sobject_evidence(tmp_path: Path) -> None:
+    """``update rows`` on a wrapper-class list must not invent a RowWrapper SObject."""
+    (tmp_path / "classes").mkdir()
+    (tmp_path / "classes" / "RowWrapper.cls").write_text(
+        "public class RowWrapper { }", encoding="utf-8")
+    (tmp_path / "classes" / "Svc.cls").write_text(
+        "public class Svc {\n"
+        "  public void f(List<RowWrapper> rows, List<Lead> leads) {\n"
+        "    update rows;\n"
+        "    update leads;\n"
+        "    List<Lead> more = [SELECT Id FROM Lead];\n"
+        "  }\n"
+        "}\n", encoding="utf-8")
+    result = extract_sf(tmp_path)
+    _assert_no_dangling_edges(result)
+    dml = {e["target"] for e in result["edges"] if e["relation"] == "dml_operates_on"}
+    assert dml == {sobject_nid("Lead"), sobject_nid("unknown")}
+    assert not any(n["id"] == sobject_nid("RowWrapper") for n in result["nodes"])
+
+
 def test_dml_variants(tmp_path: Path) -> None:
     edges = _apex_edges(tmp_path, """
     public void f(List<Opportunity> opps) {
@@ -558,6 +578,47 @@ def test_flow_parser() -> None:
     assert inv["source"] == flow_id
     assert inv["target"] == "apex_accountservice"
     assert inv["sf_flow_element"] == "Call_Apex"
+
+
+def test_apex_field_reads_and_writes(tmp_path: Path) -> None:
+    """SOQL fields, relationship paths, child subqueries, variable access and
+    constructors become field edges; a wrapper class is never taken for an SObject."""
+    _write_field(tmp_path, "Contact", "Account__c",
+                 "<type>Lookup</type><referenceTo>Account</referenceTo>"
+                 "<relationshipName>Members</relationshipName>")
+    _write_field(tmp_path, "Account", "Tier__c", "<type>Text</type>")
+    (tmp_path / "classes").mkdir()
+    (tmp_path / "classes" / "Row.cls").write_text(
+        "public class Row { public String Tier__c; }", encoding="utf-8")
+    (tmp_path / "classes" / "TierService.cls").write_text(
+        "public class TierService {\n"
+        "  public void run(Id x) {\n"
+        "    List<Account> accs = [SELECT Name, Owner.Email, (SELECT Email FROM Members__r)\n"
+        "                          FROM Account WHERE Tier__c = 'Gold'];\n"
+        "    for (Account a : accs) {\n"
+        "      a.Tier__c = 'Silver';\n"
+        "      String n = a.Name;\n"
+        "    }\n"
+        "    Row r = new Row();\n"
+        "    r.Tier__c = 'x';\n"
+        "    insert new Contact(LastName = 'Doe');\n"
+        "  }\n"
+        "}\n", encoding="utf-8")
+
+    result = extract_sf(tmp_path)
+    _assert_no_dangling_edges(result)
+    cls = apex_nid("TierService")
+    reads = {t for s, t in _field_edges(result, "reads_field") if s == cls}
+    writes = {t for s, t in _field_edges(result, "writes_field") if s == cls}
+    assert {field_nid("Account", "Name"), field_nid("User", "Email"),
+            field_nid("Account", "Tier__c"), field_nid("Contact", "Email")} <= reads
+    assert writes == {field_nid("Account", "Tier__c"), field_nid("Contact", "LastName")}
+    # Child subquery Members__r resolves through Contact.Account__c's relationshipName.
+    assert (cls, sobject_nid("Contact")) in _field_edges(result, "queries")
+    # Stub fields hang off their object too.
+    assert (field_nid("User", "Email"), sobject_nid("User")) in _field_edges(result, "field_of")
+    # Row is an Apex class: its member access never becomes a field.
+    assert not any(n["id"] == sobject_nid("Row") for n in result["nodes"])
 
 
 def test_flow_field_reads_and_writes(tmp_path: Path) -> None:
@@ -1549,6 +1610,12 @@ def test_build_keeps_every_relation_and_aggregates_sites() -> None:
     assert q["sf_in_loop"] is True  # any site in a loop
     assert "sf_occurrences" not in G[cls][acc]["dml_operates_on"]
     assert G.number_of_edges() == 2  # dangling edge dropped
+
+    # An EXTRACTED site (no explicit value) outranks an INFERRED 0.8 site.
+    extraction = _two_relation_extraction()
+    extraction["edges"][0].update(confidence="INFERRED", confidence_value=0.8)
+    q = build_sf_graph(extraction)[cls][acc]["queries"]
+    assert q["confidence"] == "EXTRACTED" and "confidence_value" not in q
 
 
 def test_written_graph_is_byte_identical_for_shuffled_input(tmp_path: Path) -> None:

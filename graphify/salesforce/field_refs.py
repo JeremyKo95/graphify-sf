@@ -14,6 +14,10 @@ merged object / field metadata:
     {"source": <node id>, "object": <parent SObject>, "child": "Contacts",
      "paths": [...], "source_file": ..., ...}        # child-relationship subquery
 
+``require_object`` references (Apex variables whose declared type might be a
+wrapper class) are kept only when the type is a known SObject that is not also
+an Apex class / interface / enum.
+
 Resolution walks each relationship segment (``Rel__r`` -> the lookup field's
 ``referenceTo``; ``Account`` -> ``AccountId``'s target, or the object of that
 name; ``Owner`` / ``CreatedBy`` / ``LastModifiedBy`` -> User). A path that
@@ -55,10 +59,13 @@ class _Index:
         self.objects: dict[str, str] = {}
         self.fields: dict[tuple[str, str], dict] = {}
         self.child_relationships: dict[str, str] = {}
+        self.apex_types: set[str] = set()
         for node in nodes:
             if node.get("file_type") == "sobject":
                 api = node.get("sf_api_name") or node.get("label", "")
                 self.objects.setdefault(api.lower(), api)
+            elif node.get("sf_code_type") in ("class", "interface", "enum"):
+                self.apex_types.add(str(node.get("label", "")).lower())
         for node in nodes:
             if node.get("file_type") != "field" or not node.get("sf_object"):
                 continue
@@ -67,6 +74,11 @@ class _Index:
             rel = node.get("sf_relationship_name")
             if rel and not node.get("sf_stub"):
                 self.child_relationships.setdefault(f"{rel}__r".lower(), obj)
+
+    def is_sobject(self, name: str) -> bool:
+        """Known SObject that is not also an Apex type (wrapper classes)."""
+        lc = name.lower()
+        return lc in self.objects and lc not in self.apex_types
 
     def canon(self, obj: str) -> str:
         return self.objects.get(obj.lower(), obj)
@@ -128,16 +140,6 @@ def resolve_field_refs(all_nodes: list[dict], all_edges: list[dict],
     index = _Index(all_nodes)
     node_ids = {n["id"] for n in all_nodes}
 
-    def ensure_field(obj: str, field: str, source_file: str) -> str:
-        from graphify.salesforce.objects import field_node
-
-        fid = field_nid(obj, field)
-        if fid not in node_ids:
-            all_nodes.append(field_node(obj, field, source_file, sf_stub=True))
-            node_ids.add(fid)
-            index.fields[(obj.lower(), field.lower())] = all_nodes[-1]
-        return fid
-
     def ensure_object(obj: str, source_file: str) -> str:
         sid = sobject_nid(obj)
         if sid not in node_ids:
@@ -146,8 +148,22 @@ def resolve_field_refs(all_nodes: list[dict], all_edges: list[dict],
             index.objects.setdefault(obj.lower(), obj)
         return sid
 
+    def ensure_field(obj: str, field: str, source_file: str) -> str:
+        from graphify.salesforce.objects import field_node
+
+        fid = field_nid(obj, field)
+        if fid not in node_ids:
+            all_nodes.append(field_node(obj, field, source_file, sf_stub=True))
+            node_ids.add(fid)
+            index.fields[(obj.lower(), field.lower())] = all_nodes[-1]
+            all_edges.append({"source": fid, "target": ensure_object(obj, source_file),
+                              "relation": "field_of", "confidence": "EXTRACTED",
+                              "source_file": source_file})
+        return fid
+
     def edge_attrs(ref: dict) -> dict:
-        skip = {"source", "object", "path", "relation", "strict", "child", "paths"}
+        skip = {"source", "object", "path", "relation", "strict", "child", "paths",
+                "require_object"}
         attrs = {k: v for k, v in ref.items() if k not in skip}
         attrs.setdefault("confidence", "EXTRACTED")
         return attrs
@@ -173,7 +189,7 @@ def resolve_field_refs(all_nodes: list[dict], all_edges: list[dict],
 
     for ref in refs:
         obj = ref.get("object")
-        if not obj:
+        if not obj or (ref.get("require_object") and not index.is_sobject(obj)):
             continue
         if "child" in ref:
             child, confidence = index.child_object(ref["child"])
