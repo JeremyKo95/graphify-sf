@@ -1342,6 +1342,82 @@ def test_pipeline_build_sf_graph_enriches(tmp_path: Path) -> None:
     assert "links" in data  # serve._load_graph reads this key
 
 
+def _two_relation_extraction() -> dict:
+    acc = sobject_nid("Account")
+    cls = apex_nid("AccService")
+    return {
+        "nodes": [
+            {"id": acc, "label": "Account", "file_type": "sobject", "source_file": "a"},
+            {"id": cls, "label": "AccService", "file_type": "code", "source_file": "c"},
+        ],
+        "edges": [
+            {"source": cls, "target": acc, "relation": "queries", "confidence": "EXTRACTED",
+             "sf_in_loop": False, "source_location": "L10", "source_file": "c"},
+            {"source": cls, "target": acc, "relation": "queries", "confidence": "EXTRACTED",
+             "sf_in_loop": True, "source_location": "L42", "source_file": "c"},
+            {"source": cls, "target": acc, "relation": "dml_operates_on",
+             "confidence": "INFERRED", "confidence_value": 0.9, "sf_dml_type": "UPDATE",
+             "source_location": "L50", "source_file": "c"},
+            {"source": cls, "target": "sobject_missing", "relation": "queries",
+             "confidence": "EXTRACTED", "source_file": "c"},
+        ],
+    }
+
+
+def test_build_keeps_every_relation_and_aggregates_sites() -> None:
+    """Reads AND writes between one pair both survive; repeated sites fold.
+
+    Real org: a DiGraph kept one edge per pair, dropping 6,292 edges — 902 of
+    them a write hidden behind a read (or vice versa) on the same object.
+    """
+    G = build_sf_graph(_two_relation_extraction())
+    assert G.is_multigraph()
+    cls, acc = apex_nid("AccService"), sobject_nid("Account")
+    assert set(G[cls][acc]) == {"queries", "dml_operates_on"}
+    q = G[cls][acc]["queries"]
+    assert q["sf_occurrences"] == 2
+    assert q["source_locations"] == ["L10", "L42"]
+    assert q["sf_in_loop"] is True  # any site in a loop
+    assert "sf_occurrences" not in G[cls][acc]["dml_operates_on"]
+    assert G.number_of_edges() == 2  # dangling edge dropped
+
+
+def test_written_graph_is_byte_identical_for_shuffled_input(tmp_path: Path) -> None:
+    import random
+
+    extraction = extract_sf(SAMPLE_ORG, include_permissions=True)
+    first = write_sf_graph(build_sf_graph(extraction), tmp_path / "a.json").read_bytes()
+    shuffled = {"nodes": list(extraction["nodes"]), "edges": list(extraction["edges"])}
+    random.Random(7).shuffle(shuffled["nodes"])
+    random.Random(7).shuffle(shuffled["edges"])
+    second = write_sf_graph(build_sf_graph(shuffled), tmp_path / "b.json").read_bytes()
+    assert first == second
+
+
+def test_cli_loads_multigraph_and_impact_lists_both_relations(tmp_path: Path) -> None:
+    from graphify.salesforce.cli import _load_graph
+
+    path = write_sf_graph(build_sf_graph(_two_relation_extraction()), tmp_path / "g.json")
+    G = _load_graph(path)
+    assert G.is_multigraph()
+    text = sf_impact(G, "AccService")["text"]
+    assert "--queries" in text and "--dml_operates_on" in text
+    # min_confidence filters per relation, not per node pair.
+    filtered = sf_impact(G, "AccService", min_confidence=0.95)["text"]
+    assert "--queries" in filtered and "--dml_operates_on" not in filtered
+
+
+def test_resolve_node_matches_qualified_and_bare_field_names() -> None:
+    from graphify.salesforce.query import resolve_node
+
+    G = nx.MultiDiGraph()
+    fid = field_nid("Account", "CLOUD_Miles__c")
+    G.add_node(fid, label="Account.CLOUD_Miles__c", file_type="field",
+               sf_qualified_name="Account.CLOUD_Miles__c", sf_api_name="CLOUD_Miles__c")
+    assert resolve_node(G, "account.cloud_miles__c") == fid
+    assert resolve_node(G, "CLOUD_Miles__c") == fid
+
+
 def _sf_query_graph() -> nx.DiGraph:
     """Small enriched SF graph for query-core tests."""
     quote = sobject_nid("SBQQ__Quote__c")

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import networkx as nx
 
-from graphify.salesforce.query import resolve_node
+from graphify.salesforce.query import edge_attrs, resolve_node
 from graphify.security import sanitize_label
 
 _COLORS = {
@@ -51,8 +51,8 @@ def focus_subgraph(
         ranked = sorted(keep - set(seeds), key=lambda n: G.degree(n), reverse=True)
         keep = set(seeds) | set(ranked[: max_nodes - len(seeds)])
 
-    edges = [(u, v) for u, v in G.edges() if u in keep and v in keep]
-    return list(keep), edges
+    edges = list(dict.fromkeys((u, v) for u, v in G.edges() if u in keep and v in keep))
+    return sorted(keep), edges
 
 
 _HTML = """<!DOCTYPE html><html lang="ko"><head><meta charset="utf-8"><title>__TITLE__</title>
@@ -111,9 +111,9 @@ def render_html(
     } for n in node_ids]
     edge_data = [{
         "source": u, "target": v,
-        "relation": G[u][v].get("relation", ""),
-        "dml": G[u][v].get("sf_dml_type", ""),
-    } for u, v in edges]
+        "relation": d.get("relation", ""),
+        "dml": d.get("sf_dml_type", ""),
+    } for u, v in edges for d in edge_attrs(G, u, v)]
     data = json.dumps({"nodes": nodes, "edges": edge_data})
     return (_HTML.replace("__DATA__", data).replace("__COLORS__", json.dumps(_COLORS))
             .replace("__TITLE__", title))

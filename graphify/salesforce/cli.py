@@ -30,15 +30,21 @@ _DEFAULT_GRAPH = Path("graphify-out") / "graph.json"
 
 
 def _load_graph(path: Path) -> nx.DiGraph:
-    """Load an enriched SF graph.json into a DiGraph (edges/links key tolerant)."""
+    """Load an enriched SF graph.json (edges/links key tolerant).
+
+    Returns a ``MultiDiGraph`` for graphs written by ``build_sf_graph`` and a
+    ``DiGraph`` for older single-relation graphs, as declared in the file.
+    """
     import json
 
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     edges_key = "links" if "links" in data else "edges"
+    multigraph = bool(data.get("multigraph", False))
     try:  # NetworkX >= 3.4 takes an ``edges`` kwarg; older versions default to "links"
-        return json_graph.node_link_graph(data, directed=True, multigraph=False, edges=edges_key)
+        return json_graph.node_link_graph(data, directed=True, multigraph=multigraph,
+                                          edges=edges_key)
     except TypeError:
-        return json_graph.node_link_graph(data, directed=True, multigraph=False)
+        return json_graph.node_link_graph(data, directed=True, multigraph=multigraph)
 
 
 def _cmd_extract(args: argparse.Namespace) -> int:

@@ -46,12 +46,26 @@ def _edge_confidence(data: dict) -> float:
     return _CONFIDENCE_VALUE.get(data.get("confidence", ""), 1.0)
 
 
+def edge_attrs(G: nx.DiGraph, u: str, v: str) -> list[dict]:
+    """Attribute dicts of every ``u -> v`` edge (one per relation in a multigraph)."""
+    if not G.has_edge(u, v):
+        return []
+    if G.is_multigraph():
+        return [G[u][v][key] for key in sorted(G[u][v])]
+    return [G[u][v]]
+
+
+def _max_confidence(G: nx.DiGraph, u: str, v: str) -> float:
+    return max((_edge_confidence(d) for d in edge_attrs(G, u, v)), default=0.0)
+
+
 def resolve_node(G: nx.DiGraph, query: str) -> str | None:
     """Resolve a user-supplied token to a node ID.
 
-    Tries, in order: exact ID, ``sobject_nid(query)``, case-insensitive label
-    match, case-insensitive substring of ID/label. Returns ``None`` if nothing
-    matches.
+    Tries, in order: exact ID, ``sobject_nid(query)``, case-insensitive
+    ``sf_qualified_name`` / label match, case-insensitive ``sf_api_name`` match
+    (a bare field name), case-insensitive substring of ID/label. Returns
+    ``None`` if nothing matches. Ties resolve to the smallest node ID.
     """
     if query in G:
         return query
@@ -59,9 +73,13 @@ def resolve_node(G: nx.DiGraph, query: str) -> str | None:
     if sid in G:
         return sid
     q = query.lower()
-    for nid, data in G.nodes(data=True):
-        if str(data.get("label", "")).lower() == q:
-            return nid
+    for attr in ("sf_qualified_name", "label", "sf_api_name"):
+        hits = sorted(
+            nid for nid, data in G.nodes(data=True)
+            if str(data.get(attr, "")).lower() == q
+        )
+        if hits:
+            return hits[0]
     for nid, data in G.nodes(data=True):
         if q in nid.lower() or q in str(data.get("label", "")).lower():
             return nid
@@ -69,7 +87,8 @@ def resolve_node(G: nx.DiGraph, query: str) -> str | None:
 
 
 def _render(G: nx.DiGraph, node_ids: list[str], edges: list[tuple[str, str]],
-            *, seeds: list[str] | None = None, token_budget: int = 2000) -> str:
+            *, seeds: list[str] | None = None, token_budget: int = 2000,
+            min_confidence: float = 0.0) -> str:
     """Render nodes + edges as token-bounded text (~3 chars/token), sanitized.
 
     Seeds render first; remaining nodes are ordered by degree (most connected
@@ -89,9 +108,12 @@ def _render(G: nx.DiGraph, node_ids: list[str], edges: list[tuple[str, str]],
             f"[type={sanitize_label(str(d.get('file_type', '')))} "
             f"src={sanitize_label(str(d.get('source_file', '')))}]"
         )
-    for u, v in edges:
-        if u in node_set and v in node_set and G.has_edge(u, v):
-            d = G[u][v]
+    for u, v in dict.fromkeys(edges):
+        if u not in node_set or v not in node_set:
+            continue
+        for d in edge_attrs(G, u, v):
+            if _edge_confidence(d) < min_confidence:
+                continue
             sev = d.get("sf_severity")
             sev_suffix = f" sev={sanitize_label(str(sev))}" if sev else ""
             lines.append(
@@ -142,7 +164,7 @@ def sf_impact(
             if direction in ("upstream", "both"):
                 neighbors += [(p, n) for p in G.predecessors(n)]
             for u, v in neighbors:
-                if _edge_confidence(G[u][v]) < min_confidence:
+                if _max_confidence(G, u, v) < min_confidence:
                     continue
                 other = v if u == n else u
                 edges.append((u, v))
@@ -153,7 +175,8 @@ def sf_impact(
         if not frontier:
             break
 
-    text = _render(G, list(visited), edges, seeds=[start], token_budget=token_budget)
+    text = _render(G, list(visited), edges, seeds=[start], token_budget=token_budget,
+                   min_confidence=min_confidence)
     header = (f"IMPACT {G.nodes[start].get('label', start)} "
               f"({direction}, depth={depth}, min_conf={min_confidence}) | "
               f"{len(visited)} nodes\n\n")
