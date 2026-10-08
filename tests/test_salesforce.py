@@ -704,6 +704,67 @@ def test_lwc_parser() -> None:
     assert calls[0]["sf_apex_method"] == "saveAccount"
 
 
+def test_pages_host_components_and_answer_where_is_it_shown(tmp_path: Path) -> None:
+    """FlexiPage + Experience view -> hosts edges to LWC / Aura bundles (review item 0).
+
+    Real org: 1,252 Experience files and 304 FlexiPages produced no nodes, so
+    "which page is this component on?" was answered with "none".
+    """
+    lwc = tmp_path / "lwc" / "tierGauge"
+    lwc.mkdir(parents=True)
+    (lwc / "tierGauge.js").write_text(
+        "import { LightningElement } from 'lwc';\nexport default class TierGauge extends LightningElement {}\n",
+        encoding="utf-8")
+    aura = tmp_path / "aura" / "LegacyBanner"
+    aura.mkdir(parents=True)
+    (aura / "LegacyBanner.cmp").write_text(
+        '<aura:component controller="BannerController" implements="flexipage:availableForAllPageTypes">'
+        "</aura:component>", encoding="utf-8")
+    page = tmp_path / "flexipages" / "Account_Record_Page.flexipage-meta.xml"
+    page.parent.mkdir()
+    page.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<FlexiPage xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <flexiPageRegions><itemInstances><componentInstance>"
+        "<componentName>tierGauge</componentName></componentInstance></itemInstances>"
+        "<itemInstances><componentInstance><componentName>LegacyBanner</componentName>"
+        "</componentInstance></itemInstances><itemInstances><componentInstance>"
+        "<componentName>force:highlightsPanel</componentName></componentInstance>"
+        "</itemInstances><itemInstances><fieldInstance><fieldItem>Record.Tier__c</fieldItem>"
+        "</fieldInstance></itemInstances></flexiPageRegions>\n"
+        "  <masterLabel>Account Record Page</masterLabel>\n"
+        "  <sobjectType>Account</sobjectType>\n  <type>RecordPage</type>\n"
+        "</FlexiPage>\n", encoding="utf-8")
+    view = tmp_path / "experiences" / "Partner_Portal1" / "views" / "home.json"
+    view.parent.mkdir(parents=True)
+    view.write_text(json.dumps({
+        "componentName": "siteforce:dynamicLayout", "label": "Home",
+        "regions": [{"components": [
+            {"componentName": "c:tierGauge"},
+            {"componentName": "forceCommunity:richText"}]}]}), encoding="utf-8")
+    _write_field(tmp_path, "Account", "Tier__c", "<type>Text</type>")
+
+    result = extract_sf(tmp_path)
+    _assert_no_dangling_edges(result)
+    hosts = _field_edges(result, "hosts")
+    page_id = "flexipage_account_record_page"
+    view_id = "experience_partner_portal1.home"
+    assert hosts == {(page_id, "lwc_tiergauge"), (page_id, "aura_legacybanner"),
+                     (view_id, "lwc_tiergauge")}
+    assert (page_id, sobject_nid("Account")) in _field_edges(result, "page_for")
+    assert (page_id, field_nid("Account", "Tier__c")) in _field_edges(result, "reads_field")
+    assert ("aura_legacybanner", apex_nid("BannerController")) in _field_edges(
+        result, "aura_controller")
+    by_id = {n["id"]: n for n in result["nodes"]}
+    assert by_id[view_id]["label"] == "Partner_Portal1/home"
+    assert by_id[page_id]["sf_standard_component_count"] == 1
+
+    # Upstream impact from the component now reaches both pages.
+    G = build_sf_graph(result)
+    up = sf_impact(G, "tierGauge", direction="upstream", depth=1)
+    assert {page_id, view_id} <= set(up["nodes"])
+
+
 def test_profile_parser() -> None:
     fixture = FIXTURES / "sf_Admin.profile-meta.xml"
     result = extract_profile(fixture)

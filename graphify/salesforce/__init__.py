@@ -47,6 +47,7 @@ def register():
         extract_custom_object,
         extract_validation_rule,
     )
+    from .pages import extract_flexipage
     from .profiles import extract_permission_set, extract_profile
 
     _DISPATCH[".cls"] = extract_apex_enhanced
@@ -65,6 +66,7 @@ def register():
     _DISPATCH[".permissionset-meta.xml"] = extract_permission_set
     _DISPATCH[".html"] = extract_lwc_html
     _DISPATCH[".js"] = extract_lwc_js
+    _DISPATCH[".flexipage-meta.xml"] = extract_flexipage
 
 
 def _parser_for(path: Path):
@@ -91,6 +93,7 @@ def _parser_for(path: Path):
         extract_custom_object,
         extract_validation_rule,
     )
+    from .pages import extract_aura_bundle, extract_experience_view, extract_flexipage
     from .profiles import extract_permission_set, extract_profile
 
     name = path.name
@@ -118,10 +121,20 @@ def _parser_for(path: Path):
         return extract_profile
     if name.endswith(".permissionset-meta.xml"):
         return extract_permission_set
+    if name.endswith(".flexipage-meta.xml"):
+        return extract_flexipage
 
     suffix = path.suffix
     if suffix in (".cls", ".trigger"):
         return extract_apex_enhanced
+    # experiences/<site>/views/<view>.json — Experience Cloud page definitions.
+    if (suffix == ".json" and path.parent.name == "views"
+            and path.parent.parent.parent.name == "experiences"):
+        return extract_experience_view
+    # aura/<Bundle>/<Bundle>.cmp|.app — the bundle's markup file.
+    if (suffix in (".cmp", ".app") and path.parent.parent.name == "aura"
+            and path.stem == path.parent.name):
+        return extract_aura_bundle
 
     # LWC HTML/JS only — guard on an lwc/ directory in the path; Jest specs
     # under __tests__ are not component code.
@@ -367,6 +380,7 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
     """
     from .cpq import cpq_analysis_pass
     from .field_refs import resolve_field_refs
+    from .pages import resolve_hosted_components
     from .flow_cpq_loops import detect_flow_cpq_loops
     from .mdt_mapping import mdt_mapping_pass
     from .governor_limits import (
@@ -419,6 +433,7 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
     # passes 4-7 are pure functions whose diagnostic edges are appended here.
     cpq_analysis_pass(all_nodes, all_edges)
     _merge_lwc_components(all_nodes, all_edges)
+    resolve_hosted_components(all_nodes, all_edges)
     mdt_mapping_pass(all_nodes, all_edges)
     _resolve_unqualified_fields(all_nodes, all_edges)
     _confirm_var_typed_dml(all_nodes, all_edges)

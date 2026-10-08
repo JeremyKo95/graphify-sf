@@ -40,6 +40,9 @@ SF_NODE_TYPE_TO_NEO4J_LABEL: dict[str, str] = {
     "aura_component": "AuraComponent",
     "concept": "Concept",
     "validation_rule": "ValidationRule",
+    "field": "Field",
+    "flexipage": "FlexiPage",
+    "experience_page": "ExperiencePage",
 }
 
 #: graphify edge ``relation`` -> Neo4j relationship type. Unknown relations fall
@@ -55,6 +58,9 @@ SF_RELATION_TO_NEO4J_TYPE: dict[str, str] = {
     "flow_invokes": "FLOW_INVOKES",
     # LWC
     "wire_to": "WIRE_TO",
+    "hosts": "HOSTS",
+    "page_for": "PAGE_FOR",
+    "aura_controller": "AURA_CONTROLLER",
     # Permission
     "grants_access_to": "GRANTS_ACCESS_TO",
     "field_of": "FIELD_OF",

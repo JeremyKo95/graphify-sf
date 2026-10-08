@@ -43,6 +43,8 @@ SF_FILE_TYPES = {
     "cmt_record",           # Custom Metadata record (customMetadata/<Type>.<Record>)
     "sharing_rule",         # Sharing Rule (owner/criteria/guest/territory)
     "custom_label",         # Custom Label ($Label.X reference target)
+    "flexipage",            # Lightning App / Record / Home page
+    "experience_page",      # Experience Cloud view (<site>/<view>)
 }
 
 
@@ -64,6 +66,11 @@ SF_RELATIONS = {
     # LWC
     "wire_to",              # LWC @wire -> Apex method
     "lwc_calls",            # LWC imperative @salesforce/apex import -> Apex method
+
+    # UI placement
+    "hosts",                # FlexiPage / Experience page -> LWC / Aura component
+    "page_for",             # Record FlexiPage -> SObject
+    "aura_controller",      # Aura bundle -> Apex controller class
 
     # Permission
     "grants_access_to",     # Profile/PermSet -> Object/Field
