@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "graphify-sfdx"
-version = "0.2.0"
+version = "0.3.0"
 description = "Salesforce-aware knowledge graph: parse SFDX metadata (Apex, Flow, LWC, CPQ, Governor Limits, Order-of-Execution) into a queryable NetworkX graph — fully offline, no org connection required."
 readme = "README.md"
 license = { file = "LICENSE" }
