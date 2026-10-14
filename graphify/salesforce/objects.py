@@ -25,6 +25,7 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from graphify.salesforce.references import GLOBAL_LABEL_RE, named_refs
 from graphify.salesforce.constants import (
     field_nid,
     sobject_nid,
@@ -41,6 +42,9 @@ _RELATIONSHIP_TYPES = {"Lookup", "MasterDetail", "Hierarchy", "MetadataRelations
 #: A field-path token in a formula: not preceded by ``$`` (global variables),
 #: ``.`` (mid-path) or a word character.
 _FORMULA_PATH_RE = re.compile(r"(?<![\w.$])([A-Za-z]\w*(?:\.[A-Za-z]\w*)*)")
+
+#: ``$Setup.Setting__c.Field__c`` — a hierarchy Custom Setting value.
+_FORMULA_SETUP_RE = re.compile(r"\$Setup\.(\w+)\.(\w+)")
 
 #: String literals inside a formula (picklist values, text) — never fields.
 _FORMULA_STRING_RE = re.compile(r"\"[^\"]*\"|'[^']*'")
@@ -110,7 +114,22 @@ def _formula_refs(source_id: str, object_api: str, formula: str | None,
             seen.add(token.lower())
             refs.append(field_ref(source_id, object_api, token, "reads_field", path,
                                   confidence="EXTRACTED", strict=True))
+    for match in _FORMULA_SETUP_RE.finditer(text):
+        refs.append(field_ref(source_id, match.group(1), match.group(2), "reads_field",
+                              path, confidence="EXTRACTED"))
     return refs
+
+
+def _formula_labels(source_id: str, formula: str | None, path: Path,
+                    nodes: list[dict], edges: list[dict]) -> None:
+    """Append ``uses_label`` edges (+ label stubs) for ``$Label.X`` in a formula."""
+    if not formula:
+        return
+    label_nodes, label_edges = named_refs(
+        source_id, "label", (m.group(1) for m in GLOBAL_LABEL_RE.finditer(formula)), path)
+    ids = {n["id"] for n in nodes}
+    nodes.extend(n for n in label_nodes if n["id"] not in ids)
+    edges.extend(label_edges)
 
 
 def _add_field(elem, object_api: str | None, field_name: str, path: Path,
@@ -147,8 +166,9 @@ def _add_field(elem, object_api: str | None, field_name: str, path: Path,
                       "sf_field_api_name": field_name,
                       "confidence": "EXTRACTED", "source_file": str(path)})
 
-    refs.extend(_formula_refs(
-        node["id"], object_api, elem.findtext("md:formula", namespaces=_NS), path))
+    formula = elem.findtext("md:formula", namespaces=_NS)
+    refs.extend(_formula_refs(node["id"], object_api, formula, path))
+    _formula_labels(node["id"], formula, path, nodes, edges)
     # Roll-up summary: "OpportunityLineItem.TotalPrice" on the child object.
     summarized = elem.findtext("md:summarizedField", namespaces=_NS)
     if summarized and "." in summarized:
@@ -266,6 +286,7 @@ def extract_custom_object(path: Path) -> dict:
             nodes, edges, api_name, sobject_id, rule_name, formula, active, path
         )
         refs.extend(_formula_refs(rule_id, api_name, formula, path))
+        _formula_labels(rule_id, formula, path, nodes, edges)
 
     return {"nodes": nodes, "edges": edges, "field_refs": refs}
 
@@ -425,5 +446,6 @@ def extract_validation_rule(path: Path) -> dict:
         nodes, edges, object_api, sobject_nid(object_api),
         rule_name, formula, active, path,
     )
+    _formula_labels(rule_id, formula, path, nodes, edges)
     return {"nodes": nodes, "edges": edges,
             "field_refs": _formula_refs(rule_id, object_api, formula, path)}

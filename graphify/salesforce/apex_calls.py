@@ -19,6 +19,11 @@ callee pair becomes one class-level ``calls`` edge, ``INFERRED``: a name match
 cannot rule out a local variable that shadows a class name. Dynamic dispatch
 (``Type.forName``, handler classes named in Custom Metadata) stays unresolved.
 
+Type declarations (``class A extends B implements C, D``, also on inner
+classes) add ``extends`` / ``implements`` edges to the repo's own classes and
+interfaces, ``EXTRACTED``; platform types (``Queueable``, ``Database.Batchable``)
+are not linked.
+
 CRITICAL (ADR-016): graph-wide pass, never cached per file. Reads the transient
 ``_source`` the Apex parser leaves on class / trigger nodes; mutates
 ``all_edges`` in place.
@@ -36,10 +41,23 @@ _CALLABLE_TYPES = ("class", "interface", "enum")
 _STATIC_CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\.\s*\w+(?:\s*\.\s*\w+)*\s*\(")
 _NEW_RE = re.compile(r"\bnew\s+(\w+)(?:\s*\.\s*\w+)*\s*\(", re.IGNORECASE)
 _CLASS_LITERAL_RE = re.compile(r"(?<![\w.])(\w+)\s*\.\s*class\b", re.IGNORECASE)
+_TYPE_HEADER_RE = re.compile(
+    r"\b(?:class|interface)\s+\w+\s*"
+    r"(?:extends\s+(?P<extends>[\w.<>,\s]+?))?\s*"
+    r"(?:implements\s+(?P<implements>[\w.<>,\s]+?))?\s*\{",
+    re.IGNORECASE)
+
+
+def _type_names(clause: str | None) -> list[str]:
+    """Last segment of each type in an ``extends`` / ``implements`` list."""
+    if not clause:
+        return []
+    clause = re.sub(r"<[^<>]*>", "", re.sub(r"<[^<>]*>", "", clause))
+    return [part.strip().split(".")[-1] for part in clause.split(",") if part.strip()]
 
 
 def apex_calls_pass(all_nodes: list[dict], all_edges: list[dict]) -> None:
-    """Append INFERRED ``calls`` edges between Apex code nodes (in place)."""
+    """Append ``calls`` / ``extends`` / ``implements`` edges between Apex code nodes (in place)."""
     callees = {
         str(n["label"]).lower(): n["id"]
         for n in all_nodes
@@ -61,6 +79,22 @@ def apex_calls_pass(all_nodes: list[dict], all_edges: list[dict]) -> None:
                     pos = match.start()
                     if pos < first_seen.get(target, len(code)):
                         first_seen[target] = pos
+        inherited: dict[tuple[str, str], int] = {}
+        for match in _TYPE_HEADER_RE.finditer(code):
+            for relation in ("extends", "implements"):
+                for name in _type_names(match.group(relation)):
+                    target = callees.get(name.lower())
+                    if target and target != node["id"]:
+                        inherited.setdefault((relation, target), match.start())
+        for (relation, target), pos in sorted(inherited.items()):
+            all_edges.append({
+                "source": node["id"],
+                "target": target,
+                "relation": relation,
+                "confidence": "EXTRACTED",
+                "source_location": f"L{code.count(chr(10), 0, pos) + 1}",
+                "source_file": node.get("source_file", ""),
+            })
         for target in sorted(first_seen):
             all_edges.append({
                 "source": node["id"],

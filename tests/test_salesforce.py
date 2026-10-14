@@ -14,9 +14,11 @@ from graphify.salesforce.constants import (
     apex_method_nid,
     apex_nid,
     field_nid,
+    metadata_nid,
     sobject_nid,
     validation_rule_nid,
 )
+from graphify.salesforce.validate_sf import validate_sf_graph
 from graphify.salesforce.cpq import cpq_analysis_pass
 from graphify.salesforce.cpq_data import extract_cpq_data
 from graphify.salesforce.flow import extract_flow
@@ -2949,3 +2951,305 @@ class TestBackwardsCompatibility:
             cwd=str(Path(__file__).parent.parent),
         )
         assert proc.returncode == 0, proc.stdout.decode() + proc.stderr.decode()
+
+
+# ---------------------------------------------------------------------------
+# Named references, inheritance, Quick Actions, email templates, resources
+# ---------------------------------------------------------------------------
+
+def _write(root: Path, rel: str, body: str) -> Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def _reference_repo(root: Path) -> Path:
+    """A small repo exercising every named-reference shape."""
+    _md_file(root, "labels/CustomLabels.labels-meta.xml", """
+<CustomLabels xmlns="http://soap.sforce.com/2006/04/metadata">
+    <labels><fullName>Greeting</fullName><value>Hi</value></labels>
+    <labels><fullName>ErrorMsg</fullName><value>Oops</value></labels>
+</CustomLabels>
+""")
+    _md_file(root, "staticresources/Logo.resource-meta.xml", """
+<StaticResource xmlns="http://soap.sforce.com/2006/04/metadata">
+    <cacheControl>Public</cacheControl><contentType>image/png</contentType>
+</StaticResource>
+""")
+    _md_file(root, "objects/AppConfig__c/AppConfig__c.object-meta.xml", """
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <customSettingsType>Hierarchy</customSettingsType>
+    <fields><fullName>Limit__c</fullName><type>Number</type></fields>
+</CustomObject>
+""")
+    _md_file(root, "objects/Account/Account.object-meta.xml", """
+<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fields><fullName>Region__c</fullName><type>Text</type></fields>
+    <fields>
+        <fullName>Banner__c</fullName><type>Text</type>
+        <formula>$Label.Greeting &amp; Region__c &amp; TEXT($Setup.AppConfig__c.Limit__c)</formula>
+    </fields>
+</CustomObject>
+""")
+    _write(root, "classes/BaseHandler.cls",
+           "public virtual class BaseHandler implements IHandler { public virtual void run() {} }\n")
+    _write(root, "classes/IHandler.cls", "public interface IHandler { void run(); }\n")
+    _write(root, "classes/AccountHandler.cls",
+           "public class AccountHandler extends BaseHandler implements Queueable {\n"
+           "    public void execute(QueueableContext ctx) {}\n"
+           "    public override void run() {\n"
+           "        String a = System.Label.Greeting;\n"
+           "        String b = Label.Missing_Label;\n"
+           "        Decimal lim = AppConfig__c.getOrgDefaults().Limit__c;\n"
+           "        String c = label.Name;\n"
+           "    }\n"
+           "}\n")
+    _md_file(root, "flows/Parent.flow-meta.xml", """
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <processType>AutoLaunchedFlow</processType>
+    <subflows><name>Call_Child</name><flowName>Child</flowName></subflows>
+    <textTemplates><name>Msg</name><text>{!$Label.ErrorMsg} {!$Setup.AppConfig__c.Limit__c}</text></textTemplates>
+</Flow>
+""")
+    _md_file(root, "flows/Child.flow-meta.xml", """
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <processType>AutoLaunchedFlow</processType>
+</Flow>
+""")
+    _write(root, "lwc/accountCard/accountCard.js",
+           "import { LightningElement } from 'lwc';\n"
+           "import REGION from '@salesforce/schema/Account.Region__c';\n"
+           "import OWNER_NAME from '@salesforce/schema/Account.Owner.Name';\n"
+           "import ACCOUNT from '@salesforce/schema/Account';\n"
+           "import greeting from '@salesforce/label/c.Greeting';\n"
+           "import logo from '@salesforce/resourceUrl/Logo';\n"
+           "import { format } from 'c/utils';\n"
+           "// import ghost from 'c/ghost';\n"
+           "/* import OLD from '@salesforce/apex/Old.run'; */\n"
+           "export default class AccountCard extends LightningElement {}\n")
+    _write(root, "lwc/accountCard/accountCard.html",
+           "<template>\n  <!-- <c-old-widget></c-old-widget> -->\n"
+           "  <c-region-badge region={region}></c-region-badge>\n</template>\n")
+    _write(root, "lwc/regionBadge/regionBadge.js",
+           "import { LightningElement } from 'lwc';\n"
+           "export default class RegionBadge extends LightningElement {}\n")
+    _write(root, "lwc/utils/utils.js", "export function format(v) { return v; }\n")
+    _write(root, "aura/LegacyPanel/LegacyPanel.cmp",
+           '<aura:component controller="AccountHandler">\n'
+           '  <img src="{!$Resource.Logo}"/> {!$Label.c.Greeting}\n'
+           '  <c:accountCard/>\n</aura:component>\n')
+    _write(root, "aura/LegacyPanel/LegacyPanelController.js",
+           "({ init: function(component) { var a = component.get('c.loadRows'); } })\n")
+    _md_file(root, "quickActions/Account.Deactivate.quickAction-meta.xml", """
+<QuickAction xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fieldOverrides><field>Region__c</field><literalValue>None</literalValue></fieldOverrides>
+    <label>Deactivate</label>
+    <quickActionLayout><quickActionLayoutColumns><quickActionLayoutItems>
+        <emptySpace>false</emptySpace><field>Name</field><uiBehavior>Edit</uiBehavior>
+    </quickActionLayoutItems></quickActionLayoutColumns></quickActionLayout>
+    <type>Update</type>
+</QuickAction>
+""")
+    _md_file(root, "quickActions/Account.Wizard.quickAction-meta.xml", """
+<QuickAction xmlns="http://soap.sforce.com/2006/04/metadata">
+    <lightningWebComponent>accountCard</lightningWebComponent>
+    <type>LightningWebComponent</type>
+</QuickAction>
+""")
+    _md_file(root, "quickActions/NewTask.quickAction-meta.xml", """
+<QuickAction xmlns="http://soap.sforce.com/2006/04/metadata">
+    <targetObject>Task</targetObject>
+    <type>Create</type>
+</QuickAction>
+""")
+    _md_file(root, "quickActions/Account.RunChild.quickAction-meta.xml", """
+<QuickAction xmlns="http://soap.sforce.com/2006/04/metadata">
+    <flowDefinition>Child</flowDefinition>
+    <type>Flow</type>
+</QuickAction>
+""")
+    _md_file(root, "email/Sales/Welcome.email-meta.xml", """
+<EmailTemplate xmlns="http://soap.sforce.com/2006/04/metadata">
+    <name>Welcome</name>
+    <subject>Hi {!Account.Name}</subject>
+    <type>text</type>
+</EmailTemplate>
+""")
+    _write(root, "email/Sales/Welcome.email",
+           "Region: {!Account.Region__c} {!Receiving_User.Name} {!$Label.Greeting}\n")
+    _md_file(root, "email/Sales/Vf.email-meta.xml", """
+<EmailTemplate xmlns="http://soap.sforce.com/2006/04/metadata">
+    <name>Vf</name><type>visualforce</type>
+</EmailTemplate>
+""")
+    _write(root, "email/Sales/Vf.email",
+           '<messaging:emailTemplate relatedToType="Account" subject="x">'
+           "{!relatedTo.Region__c}</messaging:emailTemplate>\n")
+    _md_file(root, "email/Sales/Lex.email-meta.xml", """
+<EmailTemplate xmlns="http://soap.sforce.com/2006/04/metadata">
+    <name>Lex</name><relatedEntityType>Account</relatedEntityType>
+    <subject>{{{Account.Region__c}}}</subject><type>custom</type>
+</EmailTemplate>
+""")
+    _md_file(root, "workflows/Account.workflow-meta.xml", """
+<Workflow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <alerts><fullName>Notify</fullName><template>Sales/Welcome</template></alerts>
+</Workflow>
+""")
+    return root
+
+
+def _edge_set(result: dict, relation: str) -> set[tuple[str, str]]:
+    return {(e["source"], e["target"]) for e in result["edges"] if e["relation"] == relation}
+
+
+def test_named_references_end_to_end(tmp_path: Path) -> None:
+    """Labels, resources, components, subflows, settings, inheritance and the new
+    metadata types resolve across files with no dangling edges or integrity errors."""
+    from graphify.salesforce.references import label_nid, resource_nid
+
+    result = extract_sf(_reference_repo(tmp_path))
+    _assert_no_dangling_edges(result)
+    nodes = {n["id"]: n for n in result["nodes"]}
+
+    handler, base, iface = apex_nid("AccountHandler"), apex_nid("BaseHandler"), apex_nid("IHandler")
+    card, badge, utils = "lwc_accountcard", "lwc_regionbadge", "lwc_utils"
+    greeting, error_msg = label_nid("Greeting"), label_nid("ErrorMsg")
+
+    # Labels: Apex (strict — the undefined label and ``label.Name`` are dropped),
+    # Flow, formula, LWC, Aura, email.
+    labels = _edge_set(result, "uses_label")
+    assert (handler, greeting) in labels
+    assert not any(t in (label_nid("Missing_Label"), label_nid("Name")) for _, t in labels)
+    assert label_nid("Missing_Label") not in nodes
+    assert ("flow_parent", error_msg) in labels
+    assert (field_nid("Account", "Banner__c"), greeting) in labels
+    assert (card, greeting) in labels
+    assert ("aura_legacypanel", greeting) in labels
+    assert (metadata_nid("email_template", "Sales", "Welcome"), greeting) in labels
+    assert not nodes[greeting].get("sf_stub")
+
+    # Static resources and components.
+    assert _edge_set(result, "uses_resource") == {
+        (card, resource_nid("Logo")), ("aura_legacypanel", resource_nid("Logo"))}
+    assert nodes[resource_nid("Logo")]["sf_content_type"] == "image/png"
+    assert _edge_set(result, "uses_component") == {
+        (card, utils), (card, badge), ("aura_legacypanel", card)}
+    assert "lwc_oldwidget" not in nodes and "lwc_ghost" not in nodes
+    assert apex_method_nid("Old", "run") not in nodes
+
+    # Aura -> Apex controller method.
+    assert ("aura_legacypanel", apex_method_nid("AccountHandler", "loadRows")) in \
+        _edge_set(result, "aura_calls")
+
+    # Flow subflow; Custom Setting reads from Apex, Flow and formula.
+    assert _edge_set(result, "invokes_subflow") == {("flow_parent", "flow_child")}
+    assert not nodes["flow_child"].get("sf_stub")
+    assert (handler, sobject_nid("AppConfig__c")) in _edge_set(result, "reads_setting")
+    limit = field_nid("AppConfig__c", "Limit__c")
+    reads = _edge_set(result, "reads_field")
+    assert {(handler, limit), ("flow_parent", limit),
+            (field_nid("Account", "Banner__c"), limit)} <= reads
+
+    # LWC schema imports: a field path (also through a relationship), not the object.
+    assert (card, field_nid("Account", "Region__c")) in reads
+    assert (card, field_nid("User", "Name")) in reads
+
+    # Inheritance between the repo's own types; platform interfaces are not linked.
+    assert _edge_set(result, "extends") == {(handler, base)}
+    assert (base, iface) in _edge_set(result, "implements")
+
+    # Quick Actions.
+    deactivate = metadata_nid("quick_action", "Account.Deactivate")
+    assert (deactivate, sobject_nid("Account")) in _edge_set(result, "action_for")
+    assert (deactivate, field_nid("Account", "Region__c")) in _edge_set(result, "writes_field")
+    assert (deactivate, field_nid("Account", "Name")) in _edge_set(result, "places_field")
+    dml = {(e["source"], e["target"], e["sf_dml_type"]) for e in result["edges"]
+           if e["relation"] == "dml_operates_on"}
+    assert (deactivate, sobject_nid("Account"), "UPDATE") in dml
+    assert (metadata_nid("quick_action", "NewTask"), sobject_nid("Task"), "INSERT") in dml
+    launches = _edge_set(result, "launches")
+    assert (metadata_nid("quick_action", "Account.Wizard"), card) in launches
+    assert (metadata_nid("quick_action", "Account.RunChild"), "flow_child") in launches
+
+    # Email templates: merge fields on known SObjects only; VF / Lightning forms.
+    welcome = metadata_nid("email_template", "Sales", "Welcome")
+    assert nodes[welcome]["sf_qualified_name"] == "Sales/Welcome"
+    assert {(welcome, field_nid("Account", "Name")),
+            (welcome, field_nid("Account", "Region__c")),
+            (metadata_nid("email_template", "Sales", "Vf"), field_nid("Account", "Region__c")),
+            (metadata_nid("email_template", "Sales", "Lex"), field_nid("Account", "Region__c")),
+            } <= reads
+    assert not any("receiving_user" in t for _, t in reads)
+    assert (metadata_nid("email_template", "Sales", "Lex"), sobject_nid("Account")) in \
+        _edge_set(result, "template_for")
+    assert ("workflow_account", welcome) in _edge_set(result, "uses_template")
+    assert not nodes[welcome].get("sf_stub")
+
+    G = build_sf_graph(result)
+    assert validate_sf_graph(G) == []
+
+
+def test_mdt_mapping_role_words_and_config_records() -> None:
+    """camelCase role keys map; role-less config records read fields; role-less
+    mapping-type records stay AMBIGUOUS maps_to."""
+    from graphify.salesforce.mdt_mapping import mdt_mapping_pass
+
+    def record(rid, mdt_type, values):
+        return {"id": rid, "label": rid, "file_type": "cmt_record", "source_file": "x",
+                "sf_mdt_type": mdt_type, "sf_values": values}
+
+    quote = {"id": sobject_nid("Quote"), "label": "Quote", "file_type": "sobject",
+             "source_file": "q", "sf_api_name": "Quote"}
+    nodes = [
+        quote,
+        record("cmt_clone", "CreateDefaultValueSetting__mdt",
+               {"SourceObject__c": "Opportunity", "SourceField__c": "Id",
+                "TargetField__c": "Original__c"}),
+        record("cmt_track", "ActivityTrackSource__mdt",
+               {"ObjectApiName__c": "Account", "DateField__c": "LastModifiedDate",
+                "NameField__c": "Name", "Label__c": "Account Tracking"}),
+        record("cmt_sync", "SyncFieldsWithQuote__mdt",
+               {"QuoteField__c": "AccountId", "VRBQuoteField__c": "Account__c"}),
+    ]
+    edges: list[dict] = []
+    mdt_mapping_pass(nodes, edges)
+    by_via = {}
+    for e in edges:
+        by_via.setdefault(e.get("sf_via") or e["source"], []).append(e)
+
+    clone = by_via["cmt_clone"]
+    assert [(e["source"], e["target"], e["confidence"]) for e in clone] == [
+        (field_nid("Opportunity", "Id"), field_nid(None, "Original__c"), "INFERRED")]
+
+    track = by_via["cmt_track"]
+    assert {(e["relation"], e["target"]) for e in track} == {
+        ("reads_field", field_nid("Account", "LastModifiedDate")),
+        ("reads_field", field_nid("Account", "Name"))}
+
+    sync = by_via["cmt_sync"]
+    assert len(sync) == 1 and sync[0]["relation"] == "maps_to"
+    assert sync[0]["confidence"] == "AMBIGUOUS"
+    assert sync[0]["source"] == field_nid("Quote", "AccountId")
+
+
+def test_sf_impact_follows_maps_to_against_arrow() -> None:
+    """Upstream (what uses this) from a mapped source field reaches the target
+    field and its readers; downstream from the reader does not leak back."""
+    from graphify.salesforce.query import sf_impact
+
+    G = nx.MultiDiGraph()
+    src, dst = field_nid("Opportunity", "Amount"), field_nid("Quote", "Net__c")
+    reader = apex_nid("QuoteService")
+    for nid in (src, dst, reader):
+        G.add_node(nid, label=nid, file_type="field", source_file="x")
+    G.add_edge(src, dst, key="maps_to", relation="maps_to", confidence="INFERRED")
+    G.add_edge(reader, dst, key="reads_field", relation="reads_field", confidence="EXTRACTED")
+
+    up = sf_impact(G, src, direction="upstream", depth=2)
+    assert set(up["nodes"]) == {src, dst, reader}
+
+    down = sf_impact(G, reader, direction="downstream", depth=3)
+    assert set(down["nodes"]) == {reader, dst, src}
+    assert sf_impact(G, src, direction="downstream", depth=2)["nodes"] == [src]

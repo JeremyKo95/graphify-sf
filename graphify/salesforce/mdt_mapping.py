@@ -17,10 +17,16 @@ reference when it is either:
        shared prefix with a ``*Field*`` key (holding the field API name), as in
        ``Main_Object__c`` + ``Main_Object_Api_Field__c``.
 
-Direction (source vs target) is read from role hints in the key / pairing prefix
-(``main``/``source``/``from``/``first`` vs ``second``/``target``/``to``/``dest``).
-A mapping whose direction cannot be classified still emits an edge in record order
-but is flagged ``sf_ambiguous`` with ``AMBIGUOUS`` confidence (ADR-020).
+Keys are split into words on ``_`` and camelCase (``SourceField__c`` -> source,
+field). Direction (source vs target) is read from role words in the key / pairing
+prefix (``main``/``source``/``from``/``first`` vs ``second``/``target``/``to``/
+``dest``); a field key's leading words may also name its object (``QuoteField__c``
+-> ``Quote``). A record with no role words is a mapping only when its type name says
+so (``mapping`` / ``sync`` / ``copy`` / ``to``); otherwise it is configuration
+naming fields (e.g. a tracking config's ``DateField`` / ``NameField``) and gets
+``reads_field`` edges from the record. A mapping whose direction cannot be
+classified still emits ``maps_to`` in record order, flagged ``sf_ambiguous``
+with ``AMBIGUOUS`` confidence (ADR-020).
 
 This is an analysis pass (CLAUDE.md rule 4): it runs over the whole node/edge list
 and mutates it in place, appending field stub nodes (no dangling edges, ADR-012)
@@ -37,27 +43,68 @@ from graphify.salesforce.objects import field_node
 #: A value shaped like ``Object.Field`` (single dot, identifier on each side).
 _DOTTED_RE = re.compile(r"^[A-Za-z][\w]*\.[A-Za-z][\w]*$")
 
+#: Words in an ``__mdt`` type name that mark a field-mapping table.
+_MAPPING_TYPE_WORDS = frozenset({"mapping", "mappings", "map", "sync", "copy", "twin", "to"})
+
+#: A value that can be an API name (no spaces, punctuation or numbers-only).
+_IDENT_RE = re.compile(r"^[A-Za-z][\w]*$")
+
 #: Role hint tokens (matched as whole ``_``-separated tokens, not substrings).
 _SOURCE_HINTS = frozenset({"main", "source", "from", "first", "primary", "origin", "src"})
 _TARGET_HINTS = frozenset({"second", "target", "to", "dest", "destination", "result"})
 
 
-def _norm_key(key: str) -> str:
-    return key.lower().replace("__c", "").replace("__", "_").strip("_")
+def _tokens(key: str) -> list[str]:
+    """Lower-cased words of an API name: ``VRBQuoteField__c`` -> vrb, quote, field."""
+    key = re.sub(r"__c$", "", key, flags=re.IGNORECASE)
+    return [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", key)]
 
 
-def _classify(hint: str) -> str | None:
-    """Map a key / prefix to ``"source"`` / ``"target"`` / ``None`` by role token."""
-    tokens = set(re.split(r"[_\s]+", hint.lower()))
-    if tokens & _SOURCE_HINTS:
+def _classify(tokens: list[str]) -> str | None:
+    """Map key words to ``"source"`` / ``"target"`` / ``None`` by role token."""
+    words = set(tokens)
+    if words & _SOURCE_HINTS:
         return "source"
-    if tokens & _TARGET_HINTS:
+    if words & _TARGET_HINTS:
         return "target"
     return None
 
 
-def _refs_from_values(values: dict) -> list[tuple[str | None, str | None, str]]:
-    """Return ``(role, object_api_or_None, field_api)`` field references in a record."""
+def _head_index(tokens: list[str], head: str) -> int | None:
+    """Index of *head* when the key names one (``SourceField``, ``FieldName``,
+    ``ObjectApiName``), not a property of one (``FieldLabel``, ``FieldType``)."""
+    for tail in ((), ("name",), ("api",), ("api", "name")):
+        at = len(tokens) - len(tail) - 1
+        if at >= 0 and tokens[at] == head and tuple(tokens[at + 1:]) == tail:
+            return at
+    return None
+
+
+def _is_mapping_type(record: dict) -> bool:
+    """Whether the record's ``__mdt`` type name says it maps fields."""
+    words = set(_tokens(str(record.get("sf_mdt_type", "")).removesuffix("__mdt")))
+    return bool(words & _MAPPING_TYPE_WORDS)
+
+
+def _object_from_prefix(prefix: list[str], objects: dict[str, str]) -> str | None:
+    """``QuoteField`` -> ``Quote`` when the words before ``field`` name an SObject."""
+    if not prefix:
+        return None
+    for candidate in ("".join(prefix), "_".join(prefix)):
+        for name in (candidate, f"{candidate}__c"):
+            if name in objects:
+                return objects[name]
+    return None
+
+
+def _refs_from_values(values: dict, objects: dict[str, str] | None = None
+                      ) -> list[tuple[str | None, str | None, str]]:
+    """Return ``(role, object_api_or_None, field_api)`` field references in a record.
+
+    *objects* maps lower-cased SObject API names to their spelling, used to read
+    the object from a field key's own words (``QuoteField__c``).
+    """
+    objects = objects or {}
     refs: list[tuple[str | None, str | None, str]] = []
     used: set[str] = set()
 
@@ -65,29 +112,32 @@ def _refs_from_values(values: dict) -> list[tuple[str | None, str | None, str]]:
     for key, val in values.items():
         if isinstance(val, str) and _DOTTED_RE.match(val.strip()):
             obj, fld = val.strip().split(".", 1)
-            refs.append((_classify(key), obj, fld))
+            refs.append((_classify(_tokens(key)), obj, fld))
             used.add(key)
 
-    # 2. Separated *Object* + *Field* key pairs sharing a prefix.
-    obj_keys: dict[str, str] = {}   # prefix -> object api value
-    fld_keys: list[tuple[str, str]] = []  # (normalized key, field api value)
+    # 2. Separated *Object* + *Field* keys; a field pairs with the object key
+    # whose leading words it shares (``Main_Object`` + ``Main_Object_Api_Field``).
+    obj_keys: dict[tuple[str, ...], str] = {}
+    fld_keys: list[tuple[list[str], str, int]] = []
     for key, val in values.items():
-        if key in used or not isinstance(val, str) or not val.strip():
+        if key in used or not isinstance(val, str) or not _IDENT_RE.match(val.strip()):
             continue
-        nk = _norm_key(key)
-        if nk.endswith("object"):
-            obj_keys[nk[: -len("object")].strip("_")] = val.strip()
-        elif nk.endswith("field"):
-            fld_keys.append((nk, val.strip()))
+        tokens = _tokens(key)
+        if (at := _head_index(tokens, "field")) is not None:
+            fld_keys.append((tokens, val.strip(), at))
+        elif (at := _head_index(tokens, "object")) is not None:
+            obj_keys[tuple(tokens[:at])] = val.strip()
 
-    for nk, fval in fld_keys:
-        # Pair with the longest object prefix this field key starts with.
+    for tokens, fval, at in fld_keys:
+        prefix = tokens[:at]
         match = None
-        for prefix in obj_keys:
-            if prefix and nk.startswith(prefix) and (match is None or len(prefix) > len(match)):
-                match = prefix
-        obj_api = obj_keys.get(match) if match else None
-        refs.append((_classify(match or nk), obj_api, fval))
+        for obj_prefix in obj_keys:
+            if tuple(prefix[: len(obj_prefix)]) == obj_prefix and (
+                    match is None or len(obj_prefix) > len(match)):
+                match = obj_prefix
+        obj_api = obj_keys[match] if match is not None else _object_from_prefix(prefix, objects)
+        role = _classify(tokens) or (_classify(list(match)) if match else None)
+        refs.append((role, obj_api, fval))
 
     return refs
 
@@ -103,17 +153,26 @@ def _ensure_field(nodes, by_id, api, obj, record) -> str:
 def mdt_mapping_pass(nodes: list[dict], edges: list[dict]) -> list[dict]:
     """Emit ``maps_to`` field->field edges for field-mapping ``cmt_record`` nodes.
 
+    A record without role words is a mapping only when its ``__mdt`` type name
+    says so (``…Mapping__mdt``, ``Sync…``); otherwise it is configuration that
+    *names* fields and its references become ``reads_field`` edges from the
+    record instead.
+
     Mutates ``nodes`` / ``edges`` in place (appends field stubs + edges) and also
     returns the new edges for callers that prefer the functional form.
     """
     by_id = {n["id"]: n for n in nodes}
+    objects = {
+        str(n.get("sf_api_name") or n.get("label", "")).lower(): n.get("sf_api_name") or n["label"]
+        for n in nodes if n.get("file_type") == "sobject"
+    }
     new_edges: list[dict] = []
 
     for record in [n for n in nodes if n.get("file_type") == "cmt_record"]:
         values = record.get("sf_values") or {}
         if not values:
             continue
-        refs = _refs_from_values(values)
+        refs = _refs_from_values(values, objects)
         sources = [r for r in refs if r[0] == "source"]
         targets = [r for r in refs if r[0] == "target"]
 
@@ -123,11 +182,21 @@ def mdt_mapping_pass(nodes: list[dict], edges: list[dict]) -> list[dict]:
             for s in sources:
                 for t in targets:
                     pairs.append((s, t, "INFERRED"))
-        elif len(refs) >= 2:
-            # Direction unknown — assume the first ref feeds the rest.
+        elif not (sources or targets) and len(refs) >= 2 and _is_mapping_type(record):
+            # Mapping table without role words — assume the first ref feeds the rest.
             ambiguous = True
             for t in refs[1:]:
                 pairs.append((refs[0], t, "AMBIGUOUS"))
+        else:
+            # Without an object a bare name (``Name``, ``Address``) is noise.
+            for _, obj, fld in dict.fromkeys(r for r in refs if r[1]):
+                new_edges.append({
+                    "source": record["id"],
+                    "target": _ensure_field(nodes, by_id, fld, obj, record),
+                    "relation": "reads_field", "confidence": "INFERRED",
+                    "source_file": record.get("source_file", ""),
+                })
+            continue
 
         for (_, sobj, sfld), (_, tobj, tfld), conf in pairs:
             if (sobj, sfld) == (tobj, tfld):

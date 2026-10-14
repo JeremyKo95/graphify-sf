@@ -59,6 +59,31 @@ def _max_confidence(G: nx.DiGraph, u: str, v: str) -> float:
     return max((_edge_confidence(d) for d in edge_attrs(G, u, v)), default=0.0)
 
 
+#: Relations that point from what is depended on to what depends on it — the
+#: reverse of every other edge (``reads_field`` points reader -> field). A
+#: ``maps_to`` source field feeds its target, so impact traversal walks them
+#: against their arrow.
+_REVERSED_RELATIONS = frozenset({"maps_to"})
+
+
+def _impact_neighbors(G: nx.DiGraph, n: str, direction: str) -> list[tuple[str, str]]:
+    """``(u, v)`` edges adjacent to *n* that lead in *direction* (dependency sense)."""
+    def reversed_only(u: str, v: str) -> bool:
+        return all(d.get("relation") in _REVERSED_RELATIONS for d in edge_attrs(G, u, v))
+
+    def has_reversed(u: str, v: str) -> bool:
+        return any(d.get("relation") in _REVERSED_RELATIONS for d in edge_attrs(G, u, v))
+
+    out: list[tuple[str, str]] = []
+    if direction in ("downstream", "both"):
+        out += [(n, s) for s in G.successors(n) if not reversed_only(n, s)]
+        out += [(p, n) for p in G.predecessors(n) if has_reversed(p, n)]
+    if direction in ("upstream", "both"):
+        out += [(p, n) for p in G.predecessors(n) if not reversed_only(p, n)]
+        out += [(n, s) for s in G.successors(n) if has_reversed(n, s)]
+    return list(dict.fromkeys(out))
+
+
 def resolve_node(G: nx.DiGraph, query: str) -> str | None:
     """Resolve a user-supplied token to a node ID.
 
@@ -142,8 +167,11 @@ def sf_impact(
 ) -> dict:
     """Impact traversal from *node* — "what breaks if I change this?".
 
-    ``direction``: ``downstream`` (successors — what this affects), ``upstream``
-    (predecessors — what affects this), or ``both``. Edges below
+    ``direction``: ``downstream`` (successors — what this uses), ``upstream``
+    (predecessors — what uses this, i.e. what a change here can break), or
+    ``both``. ``maps_to`` edges are walked against their arrow, since a mapped
+    target field uses its source field: upstream from ``Opportunity.Amount``
+    reaches the Quote field it is copied to and that field's readers. Edges below
     ``min_confidence`` are skipped. Returns ``{node, direction, nodes, edges,
     text}``; ``node`` is ``None`` (with an explanatory ``text``) if unresolved.
     When nothing lies in *direction* but the node has neighbors the other way,
@@ -160,12 +188,7 @@ def sf_impact(
     for _ in range(max(1, depth)):
         nxt: set[str] = set()
         for n in frontier:
-            neighbors: list[tuple[str, str]] = []
-            if direction in ("downstream", "both"):
-                neighbors += [(n, s) for s in G.successors(n)]
-            if direction in ("upstream", "both"):
-                neighbors += [(p, n) for p in G.predecessors(n)]
-            for u, v in neighbors:
+            for u, v in _impact_neighbors(G, n, direction):
                 if _max_confidence(G, u, v) < min_confidence:
                     continue
                 other = v if u == n else u
@@ -188,8 +211,8 @@ def sf_impact(
     other = {"upstream": "downstream", "downstream": "upstream"}.get(direction)
     other_count = 0
     if not edges and other:
-        other_count = len(set(G.predecessors(start) if other == "upstream"
-                              else G.successors(start)))
+        other_count = len({u if v == start else v
+                           for u, v in _impact_neighbors(G, start, other)})
     if other_count:
         result["hint"] = other
         result["text"] += (

@@ -11,7 +11,11 @@ Extracted signal:
     - ``extract_lwc_html``: an ``lwc_component`` node for the template.
     - ``extract_lwc_js``: an ``lwc_component`` node for the controller, plus
       ``wire_to`` edges (``@wire`` decorator -> imported Apex method) and
-      ``@api`` public properties recorded as node attributes.
+      ``@api`` public properties recorded as node attributes, ``reads_field``
+      references for ``@salesforce/schema`` field imports, ``uses_label`` /
+      ``uses_resource`` for label and static-resource imports, and
+      ``uses_component`` for ``c/<bundle>`` imports.
+    - The template adds ``uses_component`` per ``<c-child>`` tag.
 
 CRITICAL (ADR-002 / how-it-works "cross-file resolution"): ``wire_to`` edges
 target the SAME Apex method node ID the Apex parser produces
@@ -32,6 +36,14 @@ import re
 from pathlib import Path
 
 from graphify.salesforce.constants import apex_method_nid
+from graphify.salesforce.field_refs import field_ref
+from graphify.salesforce.references import (
+    JS_COMMENT_RE,
+    LWC_LABEL_RE,
+    LWC_RESOURCE_RE,
+    component_edges,
+    named_refs,
+)
 
 #: ``@wire(<reference>, { ... })`` — capture the decorator's first argument
 #: (the imported adapter / Apex method name).
@@ -42,6 +54,23 @@ _WIRE_RE = re.compile(r"@wire\(\s*([^,)\s]+)")
 _APEX_IMPORT_RE = re.compile(
     r"import\s+(\w+)\s+from\s+['\"]@salesforce/apex/([^/.'\"]+)\.([^/'\"]+)['\"]"
 )
+
+#: ``import F from '@salesforce/schema/Account.Owner.Name'`` — a field path
+#: (an object-only import has no ``.`` and is skipped).
+_SCHEMA_FIELD_RE = re.compile(r"['\"]@salesforce/schema/(\w+\.[\w.]+)['\"]")
+
+#: ``import { x } from 'c/otherBundle'`` — another component / module bundle.
+_C_IMPORT_RE = re.compile(r"\bfrom\s+['\"]c/(\w+)['\"]")
+
+#: ``<c-child-name`` — a child component in a template (kebab-cased bundle name).
+_CHILD_TAG_RE = re.compile(r"<c-([a-z0-9_]+(?:-[a-z0-9_]+)*)[\s/>]")
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+def _kebab_to_camel(name: str) -> str:
+    """``my-child-cmp`` -> ``myChildCmp`` (LWC bundle-name casing)."""
+    head, *rest = name.split("-")
+    return head + "".join(part[:1].upper() + part[1:] for part in rest)
+
 
 #: ``@api recordId;`` / ``@api label;`` — capture the public property name.
 _API_PROP_RE = re.compile(r"@api\s+(\w+)")
@@ -93,23 +122,26 @@ def _parse_error_node(path: Path, error_type: str, error: Exception) -> dict:
 def extract_lwc_html(path: Path) -> dict:
     """Parse an LWC ``*.html`` template file.
 
-    Emits a single ``lwc_component`` node tagged ``sf_lwc_file_type: "html"``.
-    The template structure / event handlers are intentionally not modelled — the
-    JS controller carries the analyzable behavior; the HTML node exists so the
-    merge pass can pair it with its controller.
+    Emits a single ``lwc_component`` node tagged ``sf_lwc_file_type: "html"``
+    and a ``uses_component`` edge per ``<c-child>`` tag. Event handlers and
+    bindings are intentionally not modelled — the JS controller carries the
+    analyzable behavior; the HTML node exists so the merge pass can pair it
+    with its controller.
 
     Returns:
-        ``{"nodes": [...], "edges": []}``; a ``concept`` error node on read
+        ``{"nodes": [...], "edges": [...]}``; a ``concept`` error node on read
         failure (graceful degradation, ADR-009).
     """
     path = Path(path)
     try:
         with open(path, "r", encoding="utf-8") as f:
-            f.read()
+            markup = _HTML_COMMENT_RE.sub("", f.read())
     except (OSError, UnicodeDecodeError) as exc:
         return _parse_error_node(path, "html_parse_error", exc)
 
+    children = [_kebab_to_camel(m.group(1)) for m in _CHILD_TAG_RE.finditer(markup)]
     return {
+        "edges": component_edges(f"{_lwc_id(path)}_html", children, path),
         "nodes": [
             {
                 "id": f"{_lwc_id(path)}_html",
@@ -120,7 +152,6 @@ def extract_lwc_html(path: Path) -> dict:
                 "sf_lwc_file_type": "html",
             }
         ],
-        "edges": [],
     }
 
 
@@ -140,7 +171,7 @@ def extract_lwc_js(path: Path) -> dict:
     path = Path(path)
     try:
         with open(path, "r", encoding="utf-8") as f:
-            js_content = f.read()
+            js_content = JS_COMMENT_RE.sub("", f.read())
     except (OSError, UnicodeDecodeError) as exc:
         return _parse_error_node(path, "js_parse_error", exc)
 
@@ -225,4 +256,20 @@ def extract_lwc_js(path: Path) -> dict:
     for prop_match in _API_PROP_RE.finditer(js_content):
         component_node[f"sf_api_property_{prop_match.group(1)}"] = True
 
-    return {"nodes": nodes, "edges": edges}
+    # 4. Platform imports: schema fields, labels, static resources, and other
+    # bundles of the namespace (``c/utils``) --------------------------------
+    field_refs = []
+    for match in _SCHEMA_FIELD_RE.finditer(js_content):
+        obj, _, field_path = match.group(1).partition(".")
+        field_refs.append(field_ref(lwc_id, obj, field_path, "reads_field", path,
+                                    confidence="EXTRACTED", sf_schema_import=True))
+    for kind, pattern in (("label", LWC_LABEL_RE), ("resource", LWC_RESOURCE_RE)):
+        ref_nodes, ref_edges = named_refs(
+            lwc_id, kind, (m.group(1) for m in pattern.finditer(js_content)), path)
+        nodes.extend(ref_nodes)
+        edges.extend(ref_edges)
+    imported = [m.group(1) for m in _C_IMPORT_RE.finditer(js_content)]
+    edges.extend(component_edges(
+        lwc_id, [c for c in imported if c.lower() != _bundle_name(path).lower()], path))
+
+    return {"nodes": nodes, "edges": edges, "field_refs": field_refs}

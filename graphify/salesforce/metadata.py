@@ -15,7 +15,7 @@ connects into the existing graph:
     - ``extract_workflow`` — ``workflows/<Object>.workflow-meta.xml`` ->
       ``workflow`` node + a ``dml_operates_on`` (UPDATE) edge per ``<fieldUpdates>``
       so legacy Workflow automation joins the OoE / recursion / impact analysis
-      alongside triggers and flows.
+      alongside triggers and flows; email alerts add ``uses_template``.
     - ``extract_custom_metadata_record`` — ``customMetadata/<Type>.<Record>.md-meta.xml``
       -> ``cmt_record`` node + ``cmt_record_of`` edge to its ``<Type>__mdt`` SObject.
       The ``<values>`` field/value pairs are config DATA (e.g.
@@ -37,6 +37,13 @@ connects into the existing graph:
       / plugin class). Consumer keys and secrets are never read into the graph.
     - ``extract_layout`` — ``layouts/<Obj>-<Name>.layout-meta.xml`` -> ``layout``
       node, ``layout_for`` its SObject, ``places_field`` per placed field.
+    - ``extract_quick_action`` — ``quickActions/[<Obj>.]<Name>.quickAction-meta.xml``
+      -> ``quick_action`` node: ``action_for`` its object, record DML, field
+      overrides / layout fields, ``launches`` the Flow / component it opens.
+    - ``extract_email_template`` — ``email/<Folder>/<Name>.email-meta.xml`` (+ the
+      ``.email`` body) -> ``email_template`` node with merge-field reads.
+    - ``extract_static_resource`` — ``staticresources/<Name>.resource-meta.xml``
+      -> ``static_resource`` node (descriptor only).
 
 SObject IDs resolve via ``sobject_nid`` (ADR-002); parsers emit stub target nodes
 so results carry no dangling edges (ADR-012). XML parse failures degrade to a
@@ -45,12 +52,19 @@ single ``concept`` error node (ADR-009 lenient).
 
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import unquote
 
 from graphify.salesforce.constants import apex_nid, metadata_nid, sobject_nid, sobject_stub
 from graphify.salesforce.field_refs import field_ref
+from graphify.salesforce.references import (
+    GLOBAL_LABEL_RE,
+    label_nid,
+    named_refs,
+    resource_nid,
+)
 
 _NS = {"md": "http://soap.sforce.com/2006/04/metadata"}
 
@@ -196,6 +210,18 @@ def extract_workflow(path: Path) -> dict:
                 "sf_workflow_field": fu.findtext("md:field", namespaces=_NS),
                 "sf_automation": "workflow",
             })
+    # Email alerts send a classic template named ``<Folder>/<Name>``.
+    for template in dict.fromkeys(
+            _text(alert, "template") for alert in root.findall("md:alerts", namespaces=_NS)):
+        if not template or "/" not in template:
+            continue
+        folder, _, name = template.partition("/")
+        tid = metadata_nid("email_template", folder, name)
+        nodes.append({"id": tid, "label": name, "file_type": "email_template",
+                      "source_file": str(path), "sf_qualified_name": template,
+                      "sf_stub": True})
+        edges.append({"source": wf_id, "target": tid, "relation": "uses_template",
+                      "confidence": "EXTRACTED", "source_file": str(path)})
     return {"nodes": nodes, "edges": edges}
 
 
@@ -297,9 +323,9 @@ _LABEL_VALUE_CAP = 200
 def extract_custom_labels(path: Path) -> dict:
     """Parse ``*.labels-meta.xml`` -> one ``custom_label`` node per ``<labels>``.
 
-    Labels are reference targets (``$Label.X`` / ``System.Label.X``) for Apex,
-    Flow and LWC. Nodes are emitted without edges until reference extraction
-    resolves callers; the stored value is capped to keep nodes compact.
+    Labels are reference targets (``uses_label`` from Apex, Flow, formulas, LWC,
+    Aura and email templates — see ``references.py``); the stored value is
+    capped to keep nodes compact.
     """
     path = Path(path)
     try:
@@ -314,7 +340,7 @@ def extract_custom_labels(path: Path) -> dict:
             continue
         value = (lbl.findtext("md:value", namespaces=_NS) or "").strip()
         nodes.append({
-            "id": f"label_{full.lower()}", "label": full,
+            "id": label_nid(full), "label": full, "sf_qualified_name": full,
             "file_type": "custom_label", "source_file": str(path),
             "sf_value": value[:_LABEL_VALUE_CAP],
             "sf_categories": lbl.findtext("md:categories", namespaces=_NS),
@@ -557,3 +583,171 @@ def extract_layout(path: Path) -> dict:
         for field, behavior in behaviors.items()
     ]
     return {"nodes": nodes, "edges": edges, "field_refs": field_refs}
+
+
+#: Quick Action ``<type>`` -> the element naming what it launches.
+_ACTION_LAUNCH_TAGS = {
+    "Flow": "flowDefinition",
+    "LightningComponent": "lightningComponent",
+    "LightningWebComponent": "lightningWebComponent",
+}
+
+#: Quick Action types that save a record: type -> DML performed on the target.
+_ACTION_DML = {"Create": "INSERT", "LogACall": "INSERT", "Update": "UPDATE"}
+
+
+def extract_quick_action(path: Path) -> dict:
+    """Parse ``quickActions/[<Obj>.]<Name>.quickAction-meta.xml``.
+
+    An object-specific action is ``action_for`` its object; a global action has
+    no object prefix. Create / Log-a-Call actions insert their ``targetObject``
+    and Update actions update the action's own object (``dml_operates_on``,
+    ``sf_automation: "quick_action"``); ``fieldOverrides`` are writes and layout
+    fields are ``places_field`` on that record. Flow / Lightning-component
+    actions ``launches`` what they open.
+    """
+    path = Path(path)
+    full = path.name[: -len(".quickAction-meta.xml")]
+    object_api, _, name = full.rpartition(".")
+    qid = metadata_nid("quick_action", full)
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as exc:
+        return _error_node(qid, path, exc)
+
+    action_type = _text(root, "type")
+    target_object = _text(root, "targetObject") or object_api or None
+    nodes: list[dict] = [{
+        "id": qid, "label": _text(root, "label") or _text(root, "standardLabel") or name,
+        "file_type": "quick_action", "source_file": str(path), "sf_qualified_name": full,
+        "sf_action_type": action_type, "sf_object": object_api or None,
+        "sf_target_object": _text(root, "targetObject"),
+        "sf_page": _text(root, "page"),
+    }]
+    edges: list[dict] = []
+    if object_api:
+        edges.append({"source": qid, "target": _sobject_stub(nodes, object_api, path),
+                      "relation": "action_for", "confidence": "EXTRACTED",
+                      "source_file": str(path)})
+    dml_type = _ACTION_DML.get(action_type or "")
+    if dml_type and target_object:
+        edges.append({"source": qid, "target": _sobject_stub(nodes, target_object, path),
+                      "relation": "dml_operates_on", "sf_dml_type": dml_type,
+                      "confidence": "EXTRACTED", "source_file": str(path),
+                      "sf_automation": "quick_action"})
+
+    launch_tag = _ACTION_LAUNCH_TAGS.get(action_type or "")
+    launched = _text(root, launch_tag) if launch_tag else None
+    if launched and action_type == "Flow":
+        flow_id = f"flow_{launched.lower()}"
+        nodes.append({"id": flow_id, "label": launched, "file_type": "flow",
+                      "source_file": str(path), "sf_qualified_name": launched,
+                      "sf_stub": True})
+        edges.append({"source": qid, "target": flow_id, "relation": "launches",
+                      "confidence": "EXTRACTED", "source_file": str(path)})
+    elif launched:
+        component = launched.split(":")[-1]
+        edges.append({"source": qid, "target": None, "_component": component,
+                      "relation": "launches", "confidence": "EXTRACTED",
+                      "source_file": str(path)})
+
+    field_refs: list[dict] = []
+    if target_object:
+        for override in root.findall("md:fieldOverrides", namespaces=_NS):
+            field = _text(override, "field")
+            if field:
+                field_refs.append(field_ref(qid, target_object, field, "writes_field", path,
+                                            confidence="EXTRACTED"))
+        placed = dict.fromkeys(
+            item.findtext("md:field", namespaces=_NS).strip()
+            for item in root.iter(f"{{{_NS['md']}}}quickActionLayoutItems")
+            if (item.findtext("md:field", namespaces=_NS) or "").strip())
+        for field in placed:
+            field_refs.append(field_ref(qid, target_object, field, "places_field", path,
+                                        confidence="EXTRACTED"))
+    return {"nodes": nodes, "edges": edges, "field_refs": field_refs}
+
+
+#: ``{!Opportunity.Name}`` (Classic / Visualforce) and ``{{{Case.CaseNumber}}}``
+#: (Lightning) merge fields.
+_MERGE_FIELD_RE = re.compile(r"\{!\s*([A-Za-z]\w*)\.([\w.]+)\s*\}|\{\{\{\s*([A-Za-z]\w*)\.([\w.]+)\s*\}\}\}")
+
+#: Visualforce template ``relatedToType`` / ``recipientType`` attributes.
+_VF_TYPE_RE = re.compile(r"\b(relatedToType|recipientType)\s*=\s*\"(\w+)\"")
+
+
+def extract_email_template(path: Path) -> dict:
+    """Parse ``email/<Folder>/<Name>.email-meta.xml`` and its ``<Name>.email`` body.
+
+    The ``email_template`` node (``<Folder>/<Name>``) is ``template_for`` its
+    Lightning ``relatedEntityType``. Merge fields in the subject and body become
+    ``reads_field`` references, kept only when the object is a known SObject;
+    Visualforce ``relatedTo.`` / ``recipient.`` resolve through
+    ``relatedToType`` / ``recipientType``. ``$Label`` merge fields become
+    ``uses_label``. The body text itself is never stored.
+    """
+    path = Path(path)
+    name = path.name[: -len(".email-meta.xml")]
+    folder = path.parent.name
+    qualified = f"{folder}/{name}"
+    tid = metadata_nid("email_template", folder, name)
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as exc:
+        return _error_node(tid, path, exc)
+
+    related = _text(root, "relatedEntityType")
+    nodes: list[dict] = [{
+        "id": tid, "label": _text(root, "name") or name, "file_type": "email_template",
+        "source_file": str(path), "sf_qualified_name": qualified,
+        "sf_template_type": _text(root, "type"), "sf_ui_type": _text(root, "uiType"),
+        "sf_related_entity_type": related, "sf_folder": folder,
+    }]
+    edges: list[dict] = []
+    if related:
+        edges.append({"source": tid, "target": _sobject_stub(nodes, related, path),
+                      "relation": "template_for", "confidence": "EXTRACTED",
+                      "source_file": str(path)})
+
+    texts = [_text(root, tag) or "" for tag in ("subject", "textOnly", "htmlValue")]
+    body = path.with_name(name + ".email")
+    if body.is_file():
+        texts.append(body.read_text(encoding="utf-8", errors="replace"))
+    text = "\n".join(texts)
+    aliases = {k.lower().replace("type", ""): v for k, v in _VF_TYPE_RE.findall(text)}
+
+    field_refs: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for match in _MERGE_FIELD_RE.finditer(text):
+        obj, field_path = (match.group(1), match.group(2)) if match.group(1) \
+            else (match.group(3), match.group(4))
+        obj = aliases.get(obj.lower(), obj)
+        if (obj.lower(), field_path.lower()) in seen:
+            continue
+        seen.add((obj.lower(), field_path.lower()))
+        field_refs.append(field_ref(tid, obj, field_path, "reads_field", path,
+                                    confidence="EXTRACTED", require_object=True))
+    label_nodes, label_edges = named_refs(
+        tid, "label", (m.group(1) for m in GLOBAL_LABEL_RE.finditer(text)), path)
+    nodes.extend(label_nodes)
+    edges.extend(label_edges)
+    return {"nodes": nodes, "edges": edges, "field_refs": field_refs}
+
+
+def extract_static_resource(path: Path) -> dict:
+    """Parse ``staticresources/<Name>.resource-meta.xml`` -> ``static_resource``.
+
+    The node is the target of ``uses_resource`` edges from LWC / Aura; only the
+    descriptor is read, never the resource content.
+    """
+    path = Path(path)
+    name = path.name[: -len(".resource-meta.xml")]
+    node = {"id": resource_nid(name), "label": name, "file_type": "static_resource",
+            "source_file": str(path), "sf_qualified_name": name}
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as exc:
+        return _error_node(node["id"], path, exc)
+    node["sf_content_type"] = _text(root, "contentType")
+    node["sf_cache_control"] = _text(root, "cacheControl")
+    return {"nodes": [node], "edges": []}

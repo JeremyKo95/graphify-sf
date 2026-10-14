@@ -16,6 +16,11 @@ first, tree-sitter deferred to Phase 3). It extracts:
       SOQL) are INFERRED with ``sf_dynamic``.
     - DML operations (``dml_operates_on`` edge -> SObject, ``sf_in_loop`` tagged).
     - ``implements`` of well-known interfaces (QCP, Database.Batchable hint).
+    - ``reads_setting`` edge per Custom Setting read (``Cfg__c.getInstance()`` /
+      ``getOrgDefaults()`` / ``getValues()`` / ``getAll()``), plus a field read
+      for ``Cfg__c.getOrgDefaults().Field__c``.
+    - ``uses_label`` per ``System.Label.X`` / ``Label.X`` (strict: dropped
+      unless the repo defines the label — ``label`` may be a variable).
 
 CRITICAL (ADR-002): every SObject node ID is built via ``constants.sobject_nid()``
 so the Apex, Flow and Object parsers converge on the same node in
@@ -39,6 +44,7 @@ import re
 from pathlib import Path
 
 from graphify.salesforce.field_refs import field_ref
+from graphify.salesforce.references import APEX_LABEL_RE, named_refs
 from graphify.salesforce.constants import (
     CPQ_QCP_INTERFACE,
     apex_method_nid,
@@ -633,4 +639,49 @@ def extract_apex_enhanced(path: Path) -> dict:
         nodes[0]["sf_async_pattern"] = "batchable"
 
     field_refs.extend(_field_access_refs(code, class_id, path))
+
+    # 6. Custom Setting reads (``Cfg__c.getInstance()`` and friends) ------------
+    for setting, line_no in _detect_setting_access(code):
+        target_id = sobject_nid(setting)
+        _ensure_sobject_node(nodes, target_id, setting, path)
+        edges.append({
+            "source": class_id, "target": target_id, "relation": "reads_setting",
+            "confidence": "EXTRACTED", "source_location": f"L{line_no}",
+            "source_file": str(path),
+        })
+    for match in _SETTING_FIELD_RE.finditer(code):
+        field_refs.append(field_ref(
+            class_id, match.group(1), match.group(2), "reads_field", path,
+            confidence="EXTRACTED",
+            source_location=f"L{code.count(chr(10), 0, match.start()) + 1}"))
+
+    # 7. Custom Labels (``System.Label.X``; strict — ``label`` may be a variable)
+    label_nodes, label_edges = named_refs(
+        class_id, "label", (m.group(1) for m in APEX_LABEL_RE.finditer(code)), path,
+        strict=True)
+    nodes.extend(label_nodes)
+    edges.extend(label_edges)
     return {"nodes": nodes, "edges": edges, "field_refs": field_refs}
+
+
+#: ``Cfg__c.getInstance(...)`` / ``getOrgDefaults()`` / ``getValues(...)`` /
+#: ``getAll()`` — the Custom Setting accessor methods.
+_SETTING_ACCESS_RE = re.compile(
+    r"(?<![\w.])(\w+__c)\s*\.\s*(?:getInstance|getOrgDefaults|getValues|getAll)\s*\(",
+    re.IGNORECASE)
+
+#: ``Cfg__c.getOrgDefaults().Field__c`` — a field read straight off the accessor.
+_SETTING_FIELD_RE = re.compile(
+    r"(?<![\w.])(\w+__c)\s*\.\s*(?:getInstance|getOrgDefaults|getValues)\s*"
+    r"\((?:[^()]|\([^()]*\))*\)\s*\.\s*(\w+__c)\b",
+    re.IGNORECASE)
+
+
+def _detect_setting_access(code: str) -> list[tuple[str, int]]:
+    """``(setting API name, first line)`` per Custom Setting read in *code*."""
+    first: dict[str, tuple[str, int]] = {}
+    for match in _SETTING_ACCESS_RE.finditer(code):
+        name = match.group(1)
+        if name.lower() not in first:
+            first[name.lower()] = (name, code.count("\n", 0, match.start()) + 1)
+    return list(first.values())

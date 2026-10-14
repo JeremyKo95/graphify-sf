@@ -14,7 +14,10 @@ Answers "which screen is this component on?":
     - ``extract_experience_site``: ``experiences/<site>.site-meta.xml`` -> an
       ``experience_site`` node carrying the site label and URL path prefix.
     - ``extract_aura_bundle``: ``aura/<Bundle>/<Bundle>.cmp|.app`` -> an
-      ``aura_component`` node and ``aura_controller`` -> its Apex controller.
+      ``aura_component`` node, ``aura_controller`` -> its Apex controller,
+      ``aura_calls`` -> each controller method the bundle's JS enqueues
+      (``component.get("c.method")``), ``uses_label`` / ``uses_resource`` and
+      ``uses_component`` (``<c:Child>``).
 
 Custom components are named without a namespace in FlexiPages and as
 ``c:<name>`` in Experience views; both match the bundle folder name. Pages do
@@ -31,14 +34,30 @@ import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from graphify.salesforce.constants import apex_nid, sobject_stub
+from graphify.salesforce.constants import apex_method_nid, apex_nid, sobject_stub
 from graphify.salesforce.field_refs import field_ref
+from graphify.salesforce.references import (
+    GLOBAL_LABEL_RE,
+    GLOBAL_RESOURCE_RE,
+    JS_COMMENT_RE,
+    component_edges,
+    named_refs,
+)
 
 _NS = {"md": "http://soap.sforce.com/2006/04/metadata"}
 
 #: ``controller="Ns.ClassName"`` on ``<aura:component>`` / ``<aura:application>``.
 _AURA_CONTROLLER_RE = re.compile(r"<aura:(?:component|application)\b[^>]*\bcontroller\s*=\s*\"([\w.]+)\"",
                                  re.IGNORECASE)
+
+
+#: ``component.get("c.getRecords")`` — a server-side (Apex controller) action.
+_AURA_SERVER_ACTION_RE = re.compile(r"\.get\(\s*[\"']c\.(\w+)[\"']\s*\)")
+
+_MARKUP_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+#: ``<c:ChildCmp`` — a custom child component in Aura markup.
+_AURA_CHILD_RE = re.compile(r"<c:(\w+)[\s/>]")
 
 
 def _custom_component(name: str) -> str | None:
@@ -169,10 +188,16 @@ def extract_aura_bundle(path: Path) -> dict:
     node = {"id": f"aura_{bundle.lower()}", "label": bundle, "file_type": "aura_component",
             "source_file": str(path), "sf_qualified_name": bundle}
     try:
-        markup = path.read_text(encoding="utf-8")
+        markup = _MARKUP_COMMENT_RE.sub("", path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError) as exc:
         return _error(node["id"], path, exc)
     nodes, edges = [node], []
+    scripts = ""
+    for js in sorted(path.parent.glob("*.js")):
+        try:
+            scripts += JS_COMMENT_RE.sub("", js.read_text(encoding="utf-8")) + "\n"
+        except (OSError, UnicodeDecodeError):
+            continue
     controller = _AURA_CONTROLLER_RE.search(markup)
     if controller:
         cls = controller.group(1).split(".")[-1]
@@ -181,11 +206,29 @@ def extract_aura_bundle(path: Path) -> dict:
         edges.append({"source": node["id"], "target": apex_nid(cls),
                       "relation": "aura_controller", "confidence": "EXTRACTED",
                       "source_file": str(path)})
+        for method in dict.fromkeys(m.group(1) for m in _AURA_SERVER_ACTION_RE.finditer(scripts)):
+            method_id = apex_method_nid(cls, method)
+            nodes.append({"id": method_id, "label": f"{cls}.{method}", "file_type": "code",
+                          "source_file": str(path), "sf_qualified_name": f"{cls}.{method}",
+                          "sf_method_type": "method", "sf_stub": True})
+            edges.append({"source": node["id"], "target": method_id,
+                          "relation": "aura_calls", "confidence": "EXTRACTED",
+                          "source_file": str(path)})
+    text = markup + "\n" + scripts
+    for kind, pattern in (("label", GLOBAL_LABEL_RE), ("resource", GLOBAL_RESOURCE_RE)):
+        ref_nodes, ref_edges = named_refs(
+            node["id"], kind, (m.group(1) for m in pattern.finditer(text)), path)
+        nodes.extend(ref_nodes)
+        edges.extend(ref_edges)
+    children = [m.group(1) for m in _AURA_CHILD_RE.finditer(markup)
+                if m.group(1).lower() != bundle.lower()]
+    edges.extend(component_edges(node["id"], children, path))
     return {"nodes": nodes, "edges": edges}
 
 
 def resolve_hosted_components(all_nodes: list[dict], all_edges: list[dict]) -> None:
-    """Point ``hosts`` edges at the LWC or Aura node of their component name.
+    """Point ``hosts`` / ``uses_component`` / ``launches`` edges at the LWC or
+    Aura node of their component name.
 
     A name with no bundle in the repo becomes an ``lwc_component`` stub
     (``sf_stub``) so the placement is still visible.

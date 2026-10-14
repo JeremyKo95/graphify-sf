@@ -8,8 +8,8 @@ scripts: ``graphify sf viz`` calls ``build_viz`` so the visualization is a
 first-class library feature, reproducible without glue code.
 
 Edges are styled by SF semantics: INSERT DML (record creation) is highlighted
-green, other DML amber, ``validates`` purple, diagnostics (governor / loop /
-risk) red. Nodes are colored by ``file_type`` and sized up for SObjects.
+green, other DML amber, ``validates`` purple, ``maps_to`` field mappings dashed
+cyan, diagnostics (governor / loop / risk) red. Nodes are colored by ``file_type`` and sized up for SObjects.
 """
 
 from __future__ import annotations
@@ -27,6 +27,9 @@ _COLORS = {
     "validation_rule": "#9b59b6", "field": "#f39c12", "flow": "#2ecc71",
     "cpq_rule": "#e67e22", "cpq_condition": "#d35400", "cpq_action": "#c0392b",
     "cpq_qcp_method": "#1abc9c", "profile": "#95a5a6", "concept": "#7f8c8d",
+    "aura_component": "#48c9b0", "cmt_record": "#a569bd", "custom_label": "#b7950b",
+    "static_resource": "#7d6608", "quick_action": "#5dade2", "email_template": "#f1948a",
+    "flexipage": "#45b39d", "experience_page": "#45b39d", "layout": "#85929e",
 }
 
 
@@ -63,11 +66,12 @@ body{margin:0;font-family:-apple-system,sans-serif;background:#0d1117;color:#e6e
 .lbl{font-size:9px;fill:#9aa;pointer-events:none}
 line{stroke:#444}line.create{stroke:#3fb950;stroke-width:2.5}line.dml{stroke:#e3b341;stroke-width:2}
 line.val{stroke:#a371f7}line.risk{stroke:#f85149;stroke-width:2}
+line.map{stroke:#39c5cf;stroke-width:2;stroke-dasharray:5 3}
 #tip{position:fixed;background:#161b22;border:1px solid #30363d;padding:6px 10px;border-radius:6px;font-size:12px;pointer-events:none;opacity:0}
 </style></head><body>
 <div id="h"><b>__TITLE__</b><br><span style="color:#3fb950">━ INSERT(생성)</span>
 <span style="color:#e3b341">━ DML</span> <span style="color:#a371f7">━ validates</span>
-<span style="color:#f85149">━ risk</span> &nbsp;|&nbsp; hover=상세, 드래그/줌</div>
+<span style="color:#f85149">━ risk</span> <span style="color:#39c5cf">╌ maps_to(필드 매핑)</span> &nbsp;|&nbsp; hover=상세, 드래그/줌</div>
 <svg></svg><div id="tip"></div><script>
 const DATA=__DATA__,C=__COLORS__;
 const svg=d3.select("svg"),W=innerWidth,H=innerHeight-70,g=svg.append("g");
@@ -79,6 +83,7 @@ const sim=d3.forceSimulation(DATA.nodes)
 const link=g.selectAll("line").data(DATA.edges).join("line").attr("class",d=>{
  if(d.relation==="dml_operates_on")return String(d.dml).toUpperCase()==="INSERT"?"create":"dml";
  if(d.relation==="validates")return "val";
+ if(d.relation==="maps_to")return "map";
  if(["governor_violation","infinite_loop_risk","cpq_validation_risk","gov_permission_violation"].includes(d.relation))return "risk";
  return "";});
 const node=g.selectAll("circle").data(DATA.nodes).join("circle")

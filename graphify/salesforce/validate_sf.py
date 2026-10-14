@@ -53,6 +53,9 @@ SF_FILE_TYPES = {
     "duplicate_rule",       # Duplicate Rule (duplicateRules/<Obj>.<Rule>)
     "matching_rule",        # Matching Rule (matchingRules/<Obj>)
     "auth_provider",        # Auth Provider (authproviders/<Name>)
+    "quick_action",         # Quick Action ([<Obj>.]<Name>)
+    "email_template",       # Email Template (<Folder>/<Name>)
+    "static_resource",      # Static Resource (staticresources/<Name>)
 }
 
 
@@ -66,15 +69,22 @@ SF_RELATIONS = {
     "member_of",            # Apex method -> owning class
     "implements",           # Apex class -> interface (e.g. SBQQ QCP)
     "calls",                # Apex class / trigger -> Apex class it invokes (INFERRED)
+    "extends",              # Apex class / interface -> the repo class / interface it extends
+    "reads_setting",        # Apex -> Custom Setting read via getInstance / getOrgDefaults
     "queries",              # SOQL site -> SObject
     "dml_operates_on",      # DML site -> SObject
 
     # Flow
     "flow_invokes",         # Flow ApexAction -> Apex class
+    "invokes_subflow",      # Flow -> Flow it calls as a subflow
 
     # LWC
     "wire_to",              # LWC @wire -> Apex method
     "lwc_calls",            # LWC imperative @salesforce/apex import -> Apex method
+    "aura_calls",           # Aura bundle -> Apex controller method it enqueues
+    "uses_component",       # LWC / Aura -> child component or c/ module it uses
+    "uses_label",           # Apex / Flow / formula / LWC / Aura / email -> Custom Label
+    "uses_resource",        # LWC / Aura -> Static Resource
 
     # UI placement
     "hosts",                # FlexiPage / Experience page -> LWC / Aura component
@@ -82,7 +92,11 @@ SF_RELATIONS = {
     "aura_controller",      # Aura bundle -> Apex controller class
     "contains",             # Experience site -> its pages
     "layout_for",           # Page Layout -> SObject
-    "places_field",         # Page Layout -> Field placed on it
+    "places_field",         # Page Layout / Quick Action -> Field placed on it
+    "action_for",           # Quick Action -> its SObject
+    "launches",             # Quick Action -> Flow / LWC / Aura it opens
+    "template_for",         # Email Template -> related entity SObject
+    "uses_template",        # Workflow email alert -> Email Template
 
     # Permission
     "grants_access_to",     # Profile/PermSet -> Object/Field

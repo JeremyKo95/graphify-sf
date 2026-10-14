@@ -14,6 +14,9 @@ graph nodes / edges:
     - ``flow_invokes`` edge per ``<actionCalls>`` with ``actionType=apex`` ->
       invoked Apex (resolved from ``actionName``; INFERRED — the invocable name
       is not guaranteed to equal the Apex class name).
+    - ``invokes_subflow`` edge per ``<subflows>`` -> the called Flow.
+    - ``uses_label`` per ``$Label.X``; ``$Setup.Setting__c.Field__c`` is a
+      field read on the Custom Setting.
 
     Real Salesforce Flow metadata expresses elements as **typed plural tags**
     (``<recordCreates>``, ``<recordUpdates>``, ``<recordLookups>``,
@@ -41,6 +44,7 @@ from pathlib import Path
 
 from graphify.salesforce.constants import apex_nid, sobject_stub
 from graphify.salesforce.field_refs import field_ref
+from graphify.salesforce.references import GLOBAL_LABEL_RE, named_refs
 
 #: Salesforce metadata XML namespace.
 _NS = {"md": "http://soap.sforce.com/2006/04/metadata"}
@@ -55,6 +59,9 @@ _DML_TYPE_BY_ELEMENT = {
 
 #: ``$Record.Field``, ``Var.Rel__r.Field`` mentions anywhere in the Flow XML
 #: (element references, formulas, ``{!...}`` merge fields).
+#: ``$Setup.Setting__c.Field__c`` — a hierarchy Custom Setting value.
+_SETUP_FIELD_RE = re.compile(r"\$Setup\.(\w+)\.(\w+)")
+
 _VARIABLE_FIELD_RE = re.compile(r"(?<![\w$.])(\$Record__Prior|\$Record|\w+)\.(\w+(?:\.\w+)?)")
 
 
@@ -327,7 +334,29 @@ def extract_flow(path: Path) -> dict:
             }
         )
 
-    # Other elements (decisions, assignments, loops, screens, subflows):
-    # intentionally not analyzed — Flow branching logic is out of scope.
+    # 2e. subflows -> invokes_subflow (Flow -> Flow)
+    for elem in root.findall("md:subflows", namespaces=_NS):
+        sub_name = (elem.findtext("md:flowName", namespaces=_NS) or "").strip()
+        if not sub_name:
+            continue
+        sub_id = f"flow_{sub_name.lower()}"
+        _ensure_node(nodes, {"id": sub_id, "label": sub_name, "file_type": "flow",
+                             "source_file": str(path), "sf_qualified_name": sub_name,
+                             "sf_stub": True})
+        edges.append({"source": flow_id, "target": sub_id, "relation": "invokes_subflow",
+                      "confidence": "EXTRACTED", "source_file": str(path),
+                      "sf_flow_element": elem.findtext("md:name", namespaces=_NS)})
+
+    # 2f. $Setup.Setting__c.Field__c (Custom Setting reads) and $Label.X
+    for match in _SETUP_FIELD_RE.finditer(raw):
+        _field_ref(match.group(1), match.group(2), "reads_field", None)
+    label_nodes, label_edges = named_refs(
+        flow_id, "label", (m.group(1) for m in GLOBAL_LABEL_RE.finditer(raw)), path)
+    for node in label_nodes:
+        _ensure_node(nodes, node)
+    edges.extend(label_edges)
+
+    # Other elements (decisions, assignments, loops, screens): intentionally
+    # not analyzed — Flow branching logic is out of scope.
 
     return {"nodes": nodes, "edges": edges, "field_refs": field_refs}

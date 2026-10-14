@@ -39,12 +39,15 @@ def register():
         extract_custom_labels,
         extract_custom_metadata_record,
         extract_duplicate_rule,
+        extract_email_template,
         extract_layout,
         extract_matching_rules,
         extract_permission_set_group,
+        extract_quick_action,
         extract_record_type,
         extract_rule_entries,
         extract_sharing_rules,
+        extract_static_resource,
         extract_workflow,
     )
     from .objects import (
@@ -79,6 +82,9 @@ def register():
     _DISPATCH[".matchingRule-meta.xml"] = extract_matching_rules
     _DISPATCH[".authprovider-meta.xml"] = extract_auth_provider
     _DISPATCH[".layout-meta.xml"] = extract_layout
+    _DISPATCH[".quickAction-meta.xml"] = extract_quick_action
+    _DISPATCH[".email-meta.xml"] = extract_email_template
+    _DISPATCH[".resource-meta.xml"] = extract_static_resource
 
 
 def _parser_for(path: Path):
@@ -97,12 +103,15 @@ def _parser_for(path: Path):
         extract_custom_labels,
         extract_custom_metadata_record,
         extract_duplicate_rule,
+        extract_email_template,
         extract_layout,
         extract_matching_rules,
         extract_permission_set_group,
+        extract_quick_action,
         extract_record_type,
         extract_rule_entries,
         extract_sharing_rules,
+        extract_static_resource,
         extract_workflow,
     )
     from .objects import (
@@ -153,6 +162,9 @@ def _parser_for(path: Path):
         ".matchingRule-meta.xml": extract_matching_rules,
         ".authprovider-meta.xml": extract_auth_provider,
         ".layout-meta.xml": extract_layout,
+        ".quickAction-meta.xml": extract_quick_action,
+        ".email-meta.xml": extract_email_template,
+        ".resource-meta.xml": extract_static_resource,
     }.items():
         if name.endswith(suffix):
             return parser
@@ -347,9 +359,11 @@ def _merge_lwc_components(all_nodes, all_edges):
     """
     node_by_id = {n["id"]: n for n in all_nodes}
     html_nodes = [n for n in all_nodes if n.get("sf_lwc_file_type") == "html"]
+    renamed: dict[str, str] = {}
     for html in html_nodes:
         html_id = html["id"]
         base_id = html_id[: -len("_html")] if html_id.endswith("_html") else html_id
+        renamed[html_id] = base_id
         base = node_by_id.get(base_id)
         if base is None or base is html:
             # Template-only component: promote to the base ID.
@@ -363,6 +377,8 @@ def _merge_lwc_components(all_nodes, all_edges):
         base["sf_has_template"] = True
         all_nodes.remove(html)
         node_by_id.pop(html_id, None)
+    for edge in all_edges:
+        edge["source"] = renamed.get(edge["source"], edge["source"])
 
 
 def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
@@ -375,13 +391,17 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
 
         1. ``cpq_analysis_pass``       — reclassify SBQQ__ nodes, detect QCP.
         2. ``_merge_lwc_components``   — fold LWC HTML + JS into one node.
+        2a. ``resolve_hosted_components`` / ``resolve_named_refs`` — point
+           component placements / compositions at their LWC or Aura node; drop
+           strict label references the repo does not define.
         2b. ``mdt_mapping_pass``       — turn field-mapping ``__mdt`` records into
            traversable ``maps_to`` field->field edges (e.g. Opp->Quote).
         2c. ``resolve_field_refs``     — parsers' field references (formulas,
            SOQL, Flow elements, Apex field access) become ``reads_field`` /
            ``writes_field`` edges once every object's metadata is known.
         2d. ``apex_calls_pass``        — INFERRED ``calls`` edges from Apex
-           classes / triggers to the Apex classes they invoke.
+           classes / triggers to the Apex classes they invoke, plus
+           ``extends`` / ``implements`` between the repo's own types.
         3. ``ooe_analysis_pass``       — Order of Execution chains.
         4. ``governor_limit_analysis_pass`` — diagnostic ``governor_violation``
            edges (appended to the edge list).
@@ -420,6 +440,7 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
     from .cpq import cpq_analysis_pass
     from .field_refs import resolve_field_refs
     from .pages import resolve_hosted_components
+    from .references import resolve_named_refs
     from .flow_cpq_loops import detect_flow_cpq_loops
     from .mdt_mapping import mdt_mapping_pass
     from .governor_limits import (
@@ -473,6 +494,7 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
     cpq_analysis_pass(all_nodes, all_edges)
     _merge_lwc_components(all_nodes, all_edges)
     resolve_hosted_components(all_nodes, all_edges)
+    resolve_named_refs(all_nodes, all_edges)
     mdt_mapping_pass(all_nodes, all_edges)
     _resolve_unqualified_fields(all_nodes, all_edges)
     _confirm_var_typed_dml(all_nodes, all_edges)

@@ -26,10 +26,17 @@ consumption → onboarding, analysis, impact review, and development.**
 ## Capabilities
 
 - **Parsers** (`graphify/salesforce/`): Apex classes & triggers, Flow (typed record
-  tags), LWC (`@wire` + imperative Apex), Aura bundles, Custom Object/Field,
-  Validation Rule, Record Type, Workflow, Custom Metadata records, Sharing Rules,
-  Custom Labels, Custom Settings, **Lightning pages (FlexiPage) and Experience Cloud
-  views**, and — opt-in — Profile / Permission Set / Permission Set Group.
+  tags, subflows), LWC (`@wire` + imperative Apex, schema / label / resource imports,
+  child components), Aura bundles (controller actions, child components), Custom
+  Object/Field, Validation Rule, Record Type, Workflow, Custom Metadata records,
+  Sharing Rules, Custom Labels, Custom Settings, Static Resources, Quick Actions,
+  Email Templates, **Lightning pages (FlexiPage) and Experience Cloud views**, and —
+  opt-in — Profile / Permission Set / Permission Set Group.
+- **Dependencies between components**: Apex class calls (`calls`, INFERRED) and
+  inheritance (`extends` / `implements`), Flow → subflow, LWC / Aura → child
+  component, Quick Action → the Flow or component it launches, and `uses_label` /
+  `uses_resource` from Apex, Flow, formulas, LWC, Aura and email templates to Custom
+  Labels and Static Resources.
 - **Field-level lineage**: which Apex, Flow, formula field, Validation Rule or page
   **reads** or **writes** each field (`reads_field` / `writes_field`), through
   relationship paths (`Account.Owner.Email` → `User.Email`) and child subqueries;
@@ -41,7 +48,8 @@ consumption → onboarding, analysis, impact review, and development.**
   scripts — the logic that lives as data records, not metadata.
 - **`__mdt` field mappings** (`mdt_mapping.py`): turns mapping records (e.g.
   `Opportunity_To_Quote_Mapping__mdt`) into traversable `maps_to` field→field edges so
-  impact follows the Opp→Quote boundary.
+  impact follows the Opp→Quote boundary (`sf_impact` walks them source → target;
+  `viz` draws them dashed). Config records that only name fields get `reads_field`.
 - **Analysis passes** (whole-graph): Order of Execution, Governor Limits, recursive
   triggers, Profile/FLS permission impact, Flow↔CPQ infinite loops, CPQ↔Validation
   Rule conflicts.
@@ -241,6 +249,9 @@ parse order, so a mapping that points at an ID keeps pointing at the same thing:
 | LWC / Aura (`lwc_component` / `aura_component`) | `lwc_<bundle>` / `aura_<bundle>` | bundle folder name |
 | Validation Rule (`validation_rule`) | `validation_account.need_region` | `Account.Need_Region` |
 | FlexiPage / Experience view | `flexipage_<name>` / `experience_<site>.<view>` | `<name>` / `<site>/<view>` |
+| Quick Action (`quick_action`) | `quick_action_account.deactivate` | `Account.Deactivate` (global: `<name>`) |
+| Email Template (`email_template`) | `email_template_<folder>.<name>` | `<Folder>/<Name>` |
+| Custom Label / Static Resource | `label_<name>` / `static_resource_<name>` | API name |
 
 IDs are lower-cased; `sf_qualified_name` keeps the original casing and is the
 recommended join key. Display labels live in `sf_label`.
@@ -254,8 +265,15 @@ recommended join key. Display labels live in `sf_label`.
 | `queries`, `dml_operates_on` | Apex / Flow → SObject (`sf_dynamic` for string-built SOQL) |
 | `triggers_on` | Apex trigger / record-triggered Flow → SObject |
 | `member_of` | Apex method → class |
-| `wire_to`, `lwc_calls`, `aura_controller`, `flow_invokes` | UI / Flow → Apex |
+| `calls`, `extends`, `implements` | Apex class / trigger → Apex class / interface |
+| `reads_setting` | Apex → Custom Setting read via `getInstance()` / `getOrgDefaults()` |
+| `wire_to`, `lwc_calls`, `aura_controller`, `aura_calls`, `flow_invokes` | UI / Flow → Apex |
+| `invokes_subflow` | Flow → Flow |
 | `hosts`, `page_for` | page → component, record page → SObject |
+| `uses_component` | LWC / Aura → child component or `c/` module |
+| `uses_label`, `uses_resource` | Apex / Flow / formula / LWC / Aura / email template → Custom Label, Static Resource |
+| `action_for`, `launches` | Quick Action → its SObject, → the Flow / LWC / Aura it opens |
+| `template_for`, `uses_template` | Email Template → SObject, Workflow email alert → template |
 | `cpq_*`, `maps_to`, `validates`, `order_of_execution`, diagnostics | CPQ rules, `__mdt` mappings, analysis passes |
 
 **Guarantees**
@@ -280,13 +298,16 @@ recommended join key. Display labels live in `sf_label`.
 | Field-level reads / writes (Apex, Flow, formulas, Validation Rules, pages) | `field_refs` + parsers | ✅ |
 | UI placement (FlexiPage, Experience Cloud views) | `pages` | ✅ |
 | Metadata coverage (RecordType/Workflow/Custom Metadata/Sharing/Label/Setting) | `metadata`, `objects` | ✅ |
+| Quick Actions, Email Templates, Static Resources | `metadata` | ✅ |
+| Label / resource / component references | `references` + parsers | ✅ |
 | Permissions (Profile/Permission Set/PSG) — opt-in | `profiles`, `metadata` | ✅ |
 | CPQ rule data (SFDX + Gearset + JS QCP) | `cpq_data` | ✅ |
 | `__mdt` field mapping (Opp→Quote) | `mdt_mapping` | ✅ |
 | Token-minimized consumption (cluster/query/CLI/viz/MCP) | `pipeline`, `query`, `cli`, `viz` | ✅ |
 | Integrity report (`summary.json`, `--strict`) | `quality`, `validate_sf` | ✅ |
 | Neo4j export | `neo4j_sf` | ✅ |
-| Apex cross-class call resolution | symbol table needed | ⏸ deferred |
+| Apex class-level calls and inheritance | `apex_calls` | ✅ |
+| Apex method-level call resolution | symbol table needed | ⏸ deferred |
 
 ---
 
