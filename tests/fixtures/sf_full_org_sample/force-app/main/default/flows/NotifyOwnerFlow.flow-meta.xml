@@ -9,5 +9,7 @@
     <start>
         <object>Opportunity</object>
         <recordTriggerType>Create</recordTriggerType>
+        <triggerType>RecordAfterSave</triggerType>
     </start>
+    <status>Active</status>
 </Flow>

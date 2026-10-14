@@ -54,6 +54,16 @@ _SAFE_RECURSION_PATTERNS: list[re.Pattern[str]] = [
 #: cost grows fast on dense graphs.
 _MAX_CYCLE_LENGTH = 5
 
+#: Trigger events a DML statement fires (``trigger X on Obj (before update)``).
+_DML_TRIGGER_EVENTS: dict[str, set[str]] = {
+    "INSERT": {"insert"},
+    "UPDATE": {"update"},
+    "UPSERT": {"insert", "update"},
+    "DELETE": {"delete"},
+    "UNDELETE": {"undelete"},
+    "MERGE": {"update", "delete"},
+}
+
 #: In-loop governor violations, keyed by the edge relation that carries the
 #: ``sf_in_loop`` flag. One sentinel ``concept`` node per entry (ADR-004).
 _IN_LOOP_VIOLATIONS: dict[str, dict] = {
@@ -205,6 +215,21 @@ def detect_recursive_triggers(
         if source in node_by_id and target in node_by_id:
             call_graph.add_edge(source, target)
 
+    # DML on a triggered object re-enters that object's triggers: code -> trigger.
+    trigger_events: dict[str, list[tuple[str, set[str]]]] = {}
+    for edge in all_edges:
+        if edge.get("relation") == "triggers_on" and edge.get("source") in node_by_id \
+                and node_by_id[edge["source"]].get("sf_code_type") == "trigger":
+            events = {e.split()[-1] for e in edge.get("sf_trigger_events", [])}
+            trigger_events.setdefault(edge["target"], []).append((edge["source"], events))
+    for edge in all_edges:
+        if edge.get("relation") != "dml_operates_on" or edge.get("source") not in node_by_id:
+            continue
+        fired = _DML_TRIGGER_EVENTS.get(str(edge.get("sf_dml_type", "")).upper(), set())
+        for trigger_id, events in trigger_events.get(edge.get("target"), []):
+            if fired & events:
+                call_graph.add_edge(edge["source"], trigger_id)
+
     if call_graph.number_of_edges() == 0:
         return []
 
@@ -212,9 +237,7 @@ def detect_recursive_triggers(
     # 2-cycle reported in both rotations becomes a single violation.
     seen: set[frozenset[str]] = set()
     cycles: list[list[str]] = []
-    for cycle in nx.simple_cycles(call_graph):
-        if len(cycle) > _MAX_CYCLE_LENGTH:
-            continue
+    for cycle in nx.simple_cycles(call_graph, length_bound=_MAX_CYCLE_LENGTH):
         key = frozenset(cycle)
         if key in seen:
             continue

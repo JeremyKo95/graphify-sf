@@ -30,7 +30,9 @@ _INTEGRITY_KEYS = (
 #: Node types an ontology maps onto; each must carry ``sf_qualified_name``.
 _QUALIFIED_TYPES = frozenset(
     {"sobject", "field", "flow", "lwc_component", "aura_component", "validation_rule",
-     "flexipage", "experience_page"}
+     "flexipage", "experience_page", "experience_site", "record_type", "layout",
+     "assignment_rule", "escalation_rule", "auto_response_rule", "duplicate_rule",
+     "matching_rule", "auth_provider"}
 )
 
 

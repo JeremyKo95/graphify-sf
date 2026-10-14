@@ -73,10 +73,11 @@ uvx --from graphify-sfdx graphify-sfdx --help
 ```
 
 Two console scripts are provided: **`graphify-sfdx`** (the SF CLI) and
-**`graphify-sfdx-mcp`** (the MCP server). Requires Python 3.10+. The Salesforce
-extractor itself only uses `networkx`; the package currently still installs the
-upstream graphify dependency set (tree-sitter grammars for other languages). Extras:
-`graphify-sfdx[mcp]` for the MCP server, `graphify-sfdx[neo4j]` for live Neo4j push.
+**`graphify-sfdx-mcp`** (the MCP server). Requires Python 3.10+. The only required
+dependency is `networkx`. Extras: `graphify-sfdx[mcp]` for the MCP server,
+`graphify-sfdx[neo4j]` for live Neo4j push, `graphify-sfdx[code]` for the upstream
+multi-language code-graph features (tree-sitter grammars), which the Salesforce
+extractor does not use.
 For local development, `pip install -e .` from a clone still works.
 
 ## Quick start
@@ -142,7 +143,7 @@ graphify-sfdx-mcp graphify-out/graph.json --transport http --port 8080
 Claude, Codex, Cursor, Copilot, Windsurf, … all launch the same `graphify-sfdx-mcp`
 command. Only the config file location and format differ. Use an **absolute path** to
 `graph.json`. If `graphify-sfdx` isn't installed on PATH, swap the command for
-`uvx` + `--from graphify-sfdx` (shown below) — no clone, no install step.
+`uvx` + `--from "graphify-sfdx[mcp]"` (shown below) — no clone, no install step.
 
 **Claude Code** — one command:
 
@@ -150,7 +151,7 @@ command. Only the config file location and format differ. Use an **absolute path
 # installed on PATH
 claude mcp add graphify-sfdx -- graphify-sfdx-mcp /abs/path/to/graphify-out/graph.json
 # or zero-install via uvx
-claude mcp add graphify-sfdx -- uvx --from graphify-sfdx graphify-sfdx-mcp /abs/path/to/graphify-out/graph.json
+claude mcp add graphify-sfdx -- uvx --from "graphify-sfdx[mcp]" graphify-sfdx-mcp /abs/path/to/graphify-out/graph.json
 ```
 
 **Claude Desktop / Cursor / Windsurf** — JSON config with an `mcpServers` key
@@ -161,7 +162,7 @@ claude mcp add graphify-sfdx -- uvx --from graphify-sfdx graphify-sfdx-mcp /abs/
   "mcpServers": {
     "graphify-sfdx": {
       "command": "uvx",
-      "args": ["--from", "graphify-sfdx", "graphify-sfdx-mcp", "/abs/path/to/graphify-out/graph.json"]
+      "args": ["--from", "graphify-sfdx[mcp]", "graphify-sfdx-mcp", "/abs/path/to/graphify-out/graph.json"]
     }
   }
 }
@@ -172,7 +173,7 @@ claude mcp add graphify-sfdx -- uvx --from graphify-sfdx graphify-sfdx-mcp /abs/
 ```toml
 [mcp_servers.graphify-sfdx]
 command = "uvx"
-args = ["--from", "graphify-sfdx", "graphify-sfdx-mcp", "/abs/path/to/graphify-out/graph.json"]
+args = ["--from", "graphify-sfdx[mcp]", "graphify-sfdx-mcp", "/abs/path/to/graphify-out/graph.json"]
 ```
 
 **VS Code / GitHub Copilot** — `.vscode/mcp.json` uses the `servers` key:
@@ -183,13 +184,13 @@ args = ["--from", "graphify-sfdx", "graphify-sfdx-mcp", "/abs/path/to/graphify-o
     "graphify-sfdx": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["--from", "graphify-sfdx", "graphify-sfdx-mcp", "/abs/path/to/graphify-out/graph.json"]
+      "args": ["--from", "graphify-sfdx[mcp]", "graphify-sfdx-mcp", "/abs/path/to/graphify-out/graph.json"]
     }
   }
 }
 ```
 
-> In any of these, replace the `uvx --from graphify-sfdx graphify-sfdx-mcp` command
+> In any of these, replace the `uvx --from "graphify-sfdx[mcp]" graphify-sfdx-mcp` command
 > with a bare `graphify-sfdx-mcp` if you installed the package on PATH.
 
 Then just ask, e.g. *"What breaks if I change `Opportunity.Amount`? Use graphify-sfdx."*

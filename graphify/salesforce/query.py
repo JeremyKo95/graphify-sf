@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import networkx as nx
 
-from graphify.salesforce.constants import sobject_nid
+from graphify.salesforce.constants import SALESFORCE_OOE_STEPS, sobject_nid
 from graphify.security import sanitize_label
 
 #: Diagnostic relations surfaced by ``sf_violations`` (analysis-pass outputs).
@@ -146,6 +146,8 @@ def sf_impact(
     (predecessors — what affects this), or ``both``. Edges below
     ``min_confidence`` are skipped. Returns ``{node, direction, nodes, edges,
     text}``; ``node`` is ``None`` (with an explanatory ``text``) if unresolved.
+    When nothing lies in *direction* but the node has neighbors the other way,
+    ``hint`` names that direction and the text says so.
     """
     start = resolve_node(G, node)
     if start is None:
@@ -177,11 +179,24 @@ def sf_impact(
 
     text = _render(G, list(visited), edges, seeds=[start], token_budget=token_budget,
                    min_confidence=min_confidence)
-    header = (f"IMPACT {G.nodes[start].get('label', start)} "
+    label = G.nodes[start].get('label', start)
+    header = (f"IMPACT {label} "
               f"({direction}, depth={depth}, min_conf={min_confidence}) | "
               f"{len(visited)} nodes\n\n")
-    return {"node": start, "direction": direction,
-            "nodes": sorted(visited), "edges": edges, "text": header + text}
+    result = {"node": start, "direction": direction,
+              "nodes": sorted(visited), "edges": edges, "text": header + text}
+    other = {"upstream": "downstream", "downstream": "upstream"}.get(direction)
+    other_count = 0
+    if not edges and other:
+        other_count = len(set(G.predecessors(start) if other == "upstream"
+                              else G.successors(start)))
+    if other_count:
+        result["hint"] = other
+        result["text"] += (
+            f"\n\n[hint] {sanitize_label(str(label))} has no {direction} edges but "
+            f"{other_count} {other} neighbor(s). Entry points (LWC, pages, flows) are "
+            f"rarely called by anything; try direction={other}.")
+    return result
 
 
 def sf_violations(G: nx.DiGraph, *, severity: str | None = None,
@@ -261,15 +276,32 @@ def sf_cpq_chain(G: nx.DiGraph, quote_object: str, *, token_budget: int = 2000) 
 
 
 def sf_ooe(G: nx.DiGraph, sobject: str, *, token_budget: int = 2000) -> dict:
-    """Order-of-Execution chain for *sobject* (ordered ``order_of_execution`` edges)."""
+    """Order-of-Execution chain for *sobject*: each step in order, with the
+    triggers / flows / rules attached to it by ``runs_in`` edges."""
     target = resolve_node(G, sobject)
-    chain_edges = [
+    steps = sorted(
+        (d["sf_ooe_step"], n) for n, d in G.nodes(data=True)
+        if target is not None and d.get("sf_ooe_sobject") == target
+    )
+    step_ids = {n for _, n in steps}
+    chain_edges = sorted(
         (u, v) for u, v, d in G.edges(data=True)
-        if d.get("relation") == "order_of_execution"
-        and (target is None or sobject.lower() in u.lower() or sobject.lower() in v.lower())
-    ]
-    nodes = sorted({n for e in chain_edges for n in e})
-    text = _render(G, nodes, chain_edges, token_budget=token_budget) if chain_edges \
-        else f"No Order-of-Execution chain found for {sobject!r}."
+        if d.get("relation") == "order_of_execution" and v in step_ids and u in step_ids
+    )
+    names = {num: desc for num, desc, _kind in SALESFORCE_OOE_STEPS}
+    lines = []
+    for num, nid in steps:
+        parts = sorted(
+            f"{sanitize_label(str(G.nodes[u].get('label', u)))} "
+            f"({sanitize_label(str(G.nodes[u].get('file_type', '')))})"
+            for u, _, d in G.in_edges(nid, data=True) if d.get("relation") == "runs_in"
+        )
+        line = f"{num:>2}. {names.get(num, nid)}"
+        lines.append(f"{line}: {', '.join(parts)}" if parts else line)
+    text = "\n".join(lines) or f"No Order-of-Execution chain found for {sobject!r}."
+    char_budget = token_budget * 3
+    if len(text) > char_budget:
+        text = text[:char_budget] + "\n... (truncated by token budget)"
+    label = G.nodes[target].get("label", target) if target is not None else sobject
     return {"target": target, "edges": chain_edges,
-            "text": f"Order of Execution ({len(chain_edges)} steps)\n\n{text}"}
+            "text": f"Order of Execution for {label} ({len(steps)} steps)\n\n{text}"}

@@ -10,7 +10,9 @@ Answers "which screen is this component on?":
       for Dynamic Forms ``<fieldItem>Record.Field</fieldItem>`` entries.
     - ``extract_experience_view``: ``experiences/<site>/views/<view>.json`` ->
       an ``experience_page`` node (``<site>/<view>``) with ``hosts`` -> every
-      ``c:<component>`` it places.
+      ``c:<component>`` it places, and ``contains`` from its site.
+    - ``extract_experience_site``: ``experiences/<site>.site-meta.xml`` -> an
+      ``experience_site`` node carrying the site label and URL path prefix.
     - ``extract_aura_bundle``: ``aura/<Bundle>/<Bundle>.cmp|.app`` -> an
       ``aura_component`` node and ``aura_controller`` -> its Apex controller.
 
@@ -132,7 +134,32 @@ def extract_experience_view(path: Path) -> dict:
         "sf_label": data.get("label") if isinstance(data, dict) else None,
         "sf_standard_component_count": sum(1 for c in components if not c.startswith("c:")),
     }
-    return {"nodes": [node], "edges": [_hosts_edge(page_id, c, path) for c in custom]}
+    site_node = {**_site_node(site, path), "sf_stub": True}
+    edges = [{"source": site_node["id"], "target": page_id, "relation": "contains",
+              "confidence": "EXTRACTED", "source_file": str(path)}]
+    edges += [_hosts_edge(page_id, c, path) for c in custom]
+    return {"nodes": [node, site_node], "edges": edges}
+
+
+def _site_node(site: str, path: Path) -> dict:
+    return {"id": f"experience_site_{site.lower()}", "label": site,
+            "file_type": "experience_site", "source_file": str(path),
+            "sf_qualified_name": site}
+
+
+def extract_experience_site(path: Path) -> dict:
+    """Parse ``experiences/<site>.site-meta.xml`` (the ExperienceBundle itself)."""
+    path = Path(path)
+    site = path.name[: -len(".site-meta.xml")]
+    node = _site_node(site, path)
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as exc:
+        return _error(node["id"], path, exc)
+    node["label"] = root.findtext("md:label", namespaces=_NS) or site
+    node["sf_site_type"] = root.findtext("md:type", namespaces=_NS)
+    node["sf_url_path_prefix"] = root.findtext("md:urlPathPrefix", namespaces=_NS)
+    return {"nodes": [node], "edges": []}
 
 
 def extract_aura_bundle(path: Path) -> dict:

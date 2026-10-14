@@ -5,6 +5,7 @@
         <name>Decision1</name>
         <label>Check Amount</label>
     </decisions>
+    <processType>AutoLaunchedFlow</processType>
     <recordLookups>
         <name>Get_Accounts</name>
         <label>Get Accounts</label>
@@ -44,4 +45,5 @@
         <recordTriggerType>CreateAndUpdate</recordTriggerType>
         <triggerType>RecordAfterSave</triggerType>
     </start>
+    <status>Active</status>
 </Flow>

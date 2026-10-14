@@ -3,10 +3,11 @@ graphify-sf: CPQ Rule ↔ Validation Rule field-overlap pass (ADR-030).
 
 Graph-wide diagnostic pass that flags the classic CPQ/Validation conflict: a CPQ
 Price/Product Rule *writes* a field on a Quote object while a Validation Rule on
-the **same object** *checks* that field. Because Validation runs at Order-of-
-Execution step 13 (Custom Validation) — after the CPQ Calc Engine has already
-recalculated and written the field — an overlapping field is a likely source of
-"CPQ set a value the Validation Rule then rejects" save failures (ADR-030).
+the **same object** *checks* that field. Because Validation runs in the
+Order-of-Execution "Custom Validation" step of the save the CPQ Calc Engine
+performs — after it has recalculated and written the field — an overlapping
+field is a likely source of "CPQ set a value the Validation Rule then rejects"
+save failures (ADR-030).
 
 Each overlap becomes a ``cpq_validation_risk`` edge (CPQ rule -> Validation rule,
 registered in validate_sf.py) tagged ``INFERRED`` (0.7): the field overlap is
@@ -167,7 +168,7 @@ def validation_cpq_analysis_pass(
                     "sf_note": (
                         "CPQ rule writes field(s) a Validation Rule on the same "
                         "object checks; Validation runs after CPQ recalculation "
-                        "(OoE step 13)"
+                        "(OoE Custom Validation step)"
                     ),
                 }
             )

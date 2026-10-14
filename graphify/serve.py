@@ -519,7 +519,8 @@ def _build_server(graph_path: str):
         from mcp import types
         from mcp.types import AnyUrl
     except ImportError as e:
-        raise ImportError('mcp not installed. Run: pip install "graphifyy[mcp]"') from e
+        raise ImportError(
+            f'mcp 1.x is required ({e}). Run: pip install "graphify-sfdx[mcp]"') from e
 
     G = _load_graph(graph_path)
     communities = _communities_from_graph(G)

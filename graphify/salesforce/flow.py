@@ -5,7 +5,9 @@ Parses Salesforce ``*.flow-meta.xml`` (Flow / Process Builder) metadata into
 graph nodes / edges:
 
     - ``flow`` node per Flow file, carrying the record-trigger object / type
-      read from ``<start>`` (when present).
+      read from ``<start>`` (a Process Builder's from its root-level
+      ``processMetadataValues``), plus ``<start><triggerType>`` (before / after
+      save), ``<status>`` and ``<processType>``.
     - ``queries`` edge per ``<recordLookups>`` element -> referenced SObject.
     - ``dml_operates_on`` edge per ``<recordCreates>`` / ``<recordUpdates>`` /
       ``<recordDeletes>`` element -> referenced SObject (with ``sf_dml_type``).
@@ -54,6 +56,25 @@ _DML_TYPE_BY_ELEMENT = {
 #: ``$Record.Field``, ``Var.Rel__r.Field`` mentions anywhere in the Flow XML
 #: (element references, formulas, ``{!...}`` merge fields).
 _VARIABLE_FIELD_RE = re.compile(r"(?<![\w$.])(\$Record__Prior|\$Record|\w+)\.(\w+(?:\.\w+)?)")
+
+
+#: Process Builder ``TriggerType`` metadata value -> ``recordTriggerType`` term.
+_PROCESS_TRIGGER_TYPES = {"onCreateOnly": "Create", "onAllChanges": "CreateAndUpdate"}
+
+
+def _process_builder_trigger(root) -> tuple[str | None, str | None]:
+    """(object, trigger type) of a Process Builder, from root-level
+    ``processMetadataValues`` (``ObjectType`` / ``TriggerType``)."""
+    values = {
+        pmv.findtext("md:name", namespaces=_NS):
+            pmv.findtext("md:value/md:stringValue", namespaces=_NS)
+        for pmv in root.findall("md:processMetadataValues", namespaces=_NS)
+    }
+    obj = values.get("ObjectType")
+    if not obj:
+        return None, None
+    trigger = values.get("TriggerType")
+    return obj, _PROCESS_TRIGGER_TYPES.get(trigger, trigger)
 
 
 def _flow_name(path: Path) -> str:
@@ -125,6 +146,14 @@ def extract_flow(path: Path) -> dict:
         if start_elem is not None
         else None
     )
+    flow_trigger_type = (
+        start_elem.findtext("md:triggerType", namespaces=_NS)
+        if start_elem is not None
+        else None
+    )
+    process_type = root.findtext("md:processType", namespaces=_NS)
+    if process_type == "Workflow" and not trigger_object:
+        trigger_object, trigger_type = _process_builder_trigger(root)
 
     nodes: list[dict] = [
         {
@@ -135,6 +164,9 @@ def extract_flow(path: Path) -> dict:
             "sf_qualified_name": flow_name,
             "sf_trigger_object": trigger_object,
             "sf_trigger_type": trigger_type,
+            "sf_flow_trigger_type": flow_trigger_type,
+            "sf_status": root.findtext("md:status", namespaces=_NS),
+            "sf_process_type": process_type,
         }
     ]
     edges: list[dict] = []

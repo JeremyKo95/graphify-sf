@@ -8,7 +8,10 @@ VALID_FILE_TYPES = {"code", "document", "paper", "image", "rationale", "concept"
                     # lower layer that must not import this module).
                     "field", "validation_rule", "record_type", "permission_set_group",
                     "workflow", "cpq_condition", "cpq_action",
-                    "cmt_record", "sharing_rule", "custom_label"}
+                    "cmt_record", "sharing_rule", "custom_label",
+                    "flexipage", "experience_page", "experience_site", "layout",
+                    "assignment_rule", "escalation_rule", "auto_response_rule",
+                    "duplicate_rule", "matching_rule", "auth_provider"}
 VALID_CONFIDENCES = {"EXTRACTED", "INFERRED", "AMBIGUOUS"}
 REQUIRED_NODE_FIELDS = {"id", "label", "file_type", "source_file"}
 REQUIRED_EDGE_FIELDS = {"source", "target", "relation", "confidence", "source_file"}

@@ -33,6 +33,11 @@ from graphify.salesforce.neo4j_sf import (
     to_cypher_sf,
 )
 from graphify.salesforce.metadata import (
+    extract_auth_provider,
+    extract_duplicate_rule,
+    extract_layout,
+    extract_matching_rules,
+    extract_rule_entries,
     extract_custom_labels,
     extract_custom_metadata_record,
     extract_permission_set_group,
@@ -507,13 +512,36 @@ def test_dml_variants(tmp_path: Path) -> None:
         upsert opps;
         Database.update(opps, false);
         insert new Task(Subject = 'x');
+        delete [SELECT Id FROM Case_Part__c
+                WHERE Case__c IN :ids];
+        Database.delete([select id from Contact], false);
     }""", "dml_operates_on")
     got = [(e["sf_dml_type"], e["target"]) for e in edges]
     assert got == [
         ("UPSERT", sobject_nid("Opportunity")),
         ("UPDATE", sobject_nid("Opportunity")),
         ("INSERT", sobject_nid("Task")),
+        ("DELETE", sobject_nid("Case_Part__c")),
+        ("DELETE", sobject_nid("Contact")),
     ]
+
+
+def test_flow_parser_process_builder() -> None:
+    """A Process Builder (processType Workflow) names its object in root-level
+    processMetadataValues, not in <start>; it still triggers on that object."""
+    result = extract_flow(FIXTURES / "sf_LeadProcess.flow-meta.xml")
+    assert "error" not in result
+    _assert_no_dangling_edges(result)
+
+    flow_node = next(n for n in result["nodes"] if n["file_type"] == "flow")
+    assert flow_node["sf_process_type"] == "Workflow"
+    assert flow_node["sf_trigger_object"] == "Lead"
+    assert flow_node["sf_trigger_type"] == "CreateAndUpdate"
+    assert flow_node["sf_flow_trigger_type"] is None
+    assert flow_node["sf_status"] == "Active"
+
+    triggers = [e for e in result["edges"] if e["relation"] == "triggers_on"]
+    assert [e["target"] for e in triggers] == [sobject_nid("Lead")]
 
 
 def test_flow_parser() -> None:
@@ -533,6 +561,9 @@ def test_flow_parser() -> None:
     assert flow_node["label"] == "sf_AccountFlow"
     assert flow_node["sf_trigger_object"] == "Account"
     assert flow_node["sf_trigger_type"] == "CreateAndUpdate"
+    assert flow_node["sf_flow_trigger_type"] == "RecordAfterSave"
+    assert flow_node["sf_status"] == "Active"
+    assert flow_node["sf_process_type"] == "AutoLaunchedFlow"
     flow_id = flow_node["id"]
 
     # 3. <recordLookups> -> queries edge, target resolved via sobject_nid()
@@ -743,9 +774,22 @@ def test_pages_host_components_and_answer_where_is_it_shown(tmp_path: Path) -> N
             {"componentName": "c:tierGauge"},
             {"componentName": "forceCommunity:richText"}]}]}), encoding="utf-8")
     _write_field(tmp_path, "Account", "Tier__c", "<type>Text</type>")
+    (tmp_path / "experiences" / "Partner_Portal1.site-meta.xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<ExperienceBundle xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+        "  <label>Partner Portal</label><type>ChatterNetworkPicasso</type>\n"
+        "  <urlPathPrefix>partners/s</urlPathPrefix>\n"
+        "</ExperienceBundle>\n", encoding="utf-8")
 
     result = extract_sf(tmp_path)
     _assert_no_dangling_edges(result)
+    site_id = "experience_site_partner_portal1"
+    assert _field_edges(result, "contains") == {(site_id, "experience_partner_portal1.home")}
+    site = next(n for n in result["nodes"] if n["id"] == site_id)
+    assert site["file_type"] == "experience_site" and not site.get("sf_stub")
+    assert site["label"] == "Partner Portal"
+    assert site["sf_qualified_name"] == "Partner_Portal1"
+    assert site["sf_url_path_prefix"] == "partners/s"
     hosts = _field_edges(result, "hosts")
     page_id = "flexipage_account_record_page"
     view_id = "experience_partner_portal1.home"
@@ -1335,6 +1379,147 @@ def test_flow_cpq_loops() -> None:
     assert len(loops_2) == 2
 
 
+def test_apex_calls_pass(tmp_path: Path) -> None:
+    """Class names invoked from other Apex (static call, ``new``, ``.class``)
+    become INFERRED ``calls`` edges; mentions in comments / strings, type-only
+    declarations and self-references do not."""
+    classes = tmp_path / "classes"
+    triggers = tmp_path / "triggers"
+    classes.mkdir()
+    triggers.mkdir()
+    (triggers / "AccountTrigger.trigger").write_text(
+        "trigger AccountTrigger on Account (before update, after update) {\n"
+        "    new AccountTriggerHandler().run();\n"
+        "}\n", encoding="utf-8")
+    (classes / "AccountTriggerHandler.cls").write_text(
+        "public class AccountTriggerHandler {\n"
+        "    // AccountAudit.log() is commented out\n"
+        "    String note = 'AccountAudit.log()';\n"
+        "    public void run() {\n"
+        "        accountservice.touch(Trigger.new);\n"
+        "        Dispatcher.register(AccountRules.class);\n"
+        "        AccountTriggerHandler.helper();\n"
+        "    }\n"
+        "    static void helper() {}\n"
+        "}\n", encoding="utf-8")
+    (classes / "AccountService.cls").write_text(
+        "public class AccountService {\n"
+        "    public static void touch(List<Account> rows) {\n"
+        "        AccountRules typed;\n"
+        "        update rows;\n"
+        "    }\n"
+        "}\n", encoding="utf-8")
+    for name in ("AccountAudit", "AccountRules", "Dispatcher"):
+        (classes / f"{name}.cls").write_text(
+            f"public class {name} {{ public static void register(Type t) {{}} }}\n",
+            encoding="utf-8")
+
+    result = extract_sf(tmp_path)
+    calls = {(e["source"], e["target"]) for e in result["edges"]
+             if e["relation"] == "calls"}
+    assert calls == {
+        (apex_nid("AccountTrigger"), apex_nid("AccountTriggerHandler")),
+        (apex_nid("AccountTriggerHandler"), apex_nid("AccountService")),
+        (apex_nid("AccountTriggerHandler"), apex_nid("Dispatcher")),
+        (apex_nid("AccountTriggerHandler"), apex_nid("AccountRules")),
+    }
+    call = next(e for e in result["edges"] if e["relation"] == "calls"
+                and e["source"] == apex_nid("AccountTrigger"))
+    assert call["confidence"] == "INFERRED"
+    assert call["source_location"] == "L2"
+    assert call["source_file"] == "triggers/AccountTrigger.trigger"
+
+    # The handler's service updates Account, re-firing the Account trigger:
+    # the trigger -> handler -> service -> trigger re-entry is a recursion risk.
+    recursive = [e for e in result["edges"]
+                 if e.get("sf_violation_type") == "recursive_trigger"]
+    assert len(recursive) == 1
+    assert recursive[0]["sf_cycle"] == sorted([
+        apex_nid("AccountService"), apex_nid("AccountTrigger"),
+        apex_nid("AccountTriggerHandler")])
+
+
+def _flow_xml(trigger_type: str, status: str) -> str:
+    return f"""
+<Flow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <processType>AutoLaunchedFlow</processType>
+    <start>
+        <object>Account</object>
+        <recordTriggerType>CreateAndUpdate</recordTriggerType>
+        <triggerType>{trigger_type}</triggerType>
+    </start>
+    <status>{status}</status>
+</Flow>
+"""
+
+
+def test_ooe_runs_in(tmp_path: Path) -> None:
+    """Each automation that runs in a save is attached to its OoE step with a
+    ``runs_in`` edge; inactive components are not."""
+    _md_file(tmp_path, "triggers/AccountTrigger.trigger",
+             "trigger AccountTrigger on Account (before insert, after update) {}\n")
+    _md_file(tmp_path, "flows/Acc_Before.flow-meta.xml", _flow_xml("RecordBeforeSave", "Active"))
+    _md_file(tmp_path, "flows/Acc_After.flow-meta.xml", _flow_xml("RecordAfterSave", "Active"))
+    _md_file(tmp_path, "flows/Acc_Draft.flow-meta.xml", _flow_xml("RecordAfterSave", "Draft"))
+    _md_file(tmp_path, "objects/Account/validationRules/Need_Name.validationRule-meta.xml", """
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Need_Name</fullName><active>true</active>
+    <errorConditionFormula>ISBLANK(Name)</errorConditionFormula>
+</ValidationRule>
+""")
+    _md_file(tmp_path, "duplicateRules/Account.Dup.duplicateRule-meta.xml", """
+<DuplicateRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <isActive>true</isActive><masterLabel>Dup</masterLabel>
+</DuplicateRule>
+""")
+    _md_file(tmp_path, "workflows/Account.workflow-meta.xml", """
+<Workflow xmlns="http://soap.sforce.com/2006/04/metadata">
+    <rules><fullName>Notify</fullName><active>true</active></rules>
+    <rules><fullName>Retired</fullName><active>false</active></rules>
+</Workflow>
+""")
+    _md_file(tmp_path, "sharingRules/Account.sharingRules-meta.xml", """
+<SharingRules xmlns="http://soap.sforce.com/2006/04/metadata">
+    <sharingCriteriaRules>
+        <fullName>Big</fullName><accessLevel>Read</accessLevel>
+    </sharingCriteriaRules>
+    <sharingOwnerRules>
+        <fullName>Team</fullName><accessLevel>Read</accessLevel>
+    </sharingOwnerRules>
+</SharingRules>
+""")
+    _md_file(tmp_path, "assignmentRules/Lead.assignmentRules-meta.xml", """
+<AssignmentRules xmlns="http://soap.sforce.com/2006/04/metadata">
+    <assignmentRule><fullName>Std</fullName><active>true</active></assignmentRule>
+</AssignmentRules>
+""")
+
+    result = extract_sf(tmp_path)
+    _assert_no_dangling_edges(result)
+    labels = {n["id"]: n["label"] for n in result["nodes"]}
+    runs_in = sorted((labels[e["source"]], labels[e["target"]])
+                     for e in result["edges"] if e["relation"] == "runs_in")
+    assert runs_in == [
+        ("Acc_After", "Account: After-Save Flow"),
+        ("Acc_Before", "Account: Before-Save Flow"),
+        ("Account", "Account: Workflow Rules"),
+        ("AccountTrigger", "Account: After Trigger"),
+        ("AccountTrigger", "Account: Before Trigger"),
+        ("Big", "Account: Criteria-Based Sharing"),
+        ("Dup", "Account: Duplicate Rules"),
+        ("Need_Name", "Account: Custom Validation"),
+        ("Std", "Lead: Assignment Rules"),
+    ]
+    # Steps follow the documented order: before-save flows precede before triggers.
+    steps = {n["label"]: n["sf_ooe_step"] for n in result["nodes"] if "sf_ooe_step" in n}
+    assert steps["Account: Before-Save Flow"] < steps["Account: Before Trigger"]
+    assert steps["Account: Escalation Rules"] < steps["Account: After-Save Flow"]
+
+    G = build_sf_graph(result)
+    text = sf_ooe(G, "Account")["text"]
+    assert "Acc_Before" in text and "AccountTrigger" in text
+
+
 def test_detect_recursive_triggers() -> None:
     """``calls`` cycles -> governor_violation; guarded recursion downgraded."""
     all_nodes: list[dict] = [
@@ -1725,8 +1910,10 @@ def _sf_query_graph() -> nx.DiGraph:
     G.add_node("apex_weak", label="WeakLink", file_type="code")
     G.add_node(quote, label="SBQQ__Quote__c", file_type="sobject")
     G.add_node("cpq_rule_disc", label="SBQQ__PriceRule__c Discount", file_type="cpq_rule")
-    G.add_node("ooe_quote_1", label="OoE Quote step1", file_type="concept")
-    G.add_node("ooe_quote_2", label="OoE Quote step2", file_type="concept")
+    G.add_node(f"ooe_{quote}_1", label="SBQQ__Quote__c: System Validation",
+               file_type="concept", sf_ooe_step=1, sf_ooe_sobject=quote)
+    G.add_node(f"ooe_{quote}_2", label="SBQQ__Quote__c: Before-Save Flow",
+               file_type="concept", sf_ooe_step=2, sf_ooe_sobject=quote)
 
     G.add_edge("apex_accounttrigger", "sobject_opportunity",
                relation="queries", confidence="EXTRACTED", confidence_value=1.0)
@@ -1737,7 +1924,7 @@ def _sf_query_graph() -> nx.DiGraph:
                relation="calls", confidence="AMBIGUOUS", confidence_value=0.4)
     G.add_edge("cpq_rule_disc", quote,
                relation="cpq_applies_to", confidence="INFERRED", execution_order=2)
-    G.add_edge("ooe_quote_1", "ooe_quote_2",
+    G.add_edge(f"ooe_{quote}_1", f"ooe_{quote}_2",
                relation="order_of_execution", confidence="EXTRACTED")
     return G
 
@@ -1771,14 +1958,30 @@ def test_sf_violations_and_severity_filter() -> None:
     assert sf_violations(G, severity="CRITICAL")["violations"] == []
 
 
+def test_sf_impact_hints_other_direction() -> None:
+    """An entry point has nothing upstream; an empty result says which way to look."""
+    G = nx.MultiDiGraph()
+    G.add_node("lwc_tiergauge", label="tierGauge", file_type="lwc_component")
+    G.add_node("apex_ctl.get", label="Ctl.get", file_type="code")
+    G.add_edge("lwc_tiergauge", "apex_ctl.get", relation="wire_to", confidence="INFERRED")
+
+    up = sf_impact(G, "tierGauge", direction="upstream")
+    assert up["hint"] == "downstream"
+    assert "direction=downstream" in up["text"]
+    down = sf_impact(G, "tierGauge", direction="downstream")
+    assert down.get("hint") is None and "hint" not in down["text"]
+
+
 def test_sf_cpq_chain_and_ooe() -> None:
     G = _sf_query_graph()
     chain = sf_cpq_chain(G, "SBQQ__Quote__c")
     assert chain["target"] == sobject_nid("SBQQ__Quote__c")
     assert any(s.get("execution_order") == 2 for s in chain["steps"])
 
-    ooe = sf_ooe(G, "Quote")
-    assert ("ooe_quote_1", "ooe_quote_2") in ooe["edges"]
+    quote = sobject_nid("SBQQ__Quote__c")
+    ooe = sf_ooe(G, "SBQQ__Quote__c")
+    assert (f"ooe_{quote}_1", f"ooe_{quote}_2") in ooe["edges"]
+    assert " 2. Before-Save Flow" in ooe["text"]
 
 
 def test_cpq_data_parser() -> None:
@@ -2003,9 +2206,210 @@ def test_record_type_parser(tmp_path: Path) -> None:
     node = next(n for n in result["nodes"] if n["file_type"] == "record_type")
     assert node["sf_object"] == "SBQQ__Quote__c"
     assert node["label"] == "Builder Quote"
+    assert node["sf_qualified_name"] == "SBQQ__Quote__c.Builder"
     edge = next(e for e in result["edges"] if e["relation"] == "record_type_of")
     assert edge["source"] == node["id"]
     assert edge["target"] == sobject_nid("SBQQ__Quote__c")
+
+
+_MD_XML = '<?xml version="1.0" encoding="UTF-8"?>\n'
+
+
+def _md_file(root: Path, rel: str, body: str) -> Path:
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_MD_XML + body, encoding="utf-8")
+    return path
+
+
+def _field_refs_by(result: dict) -> set[tuple[str, str, str]]:
+    return {(r["object"], r["path"], r["relation"]) for r in result.get("field_refs", [])}
+
+
+def test_assignment_rules_parser(tmp_path: Path) -> None:
+    """assignmentRules/<Obj>.assignmentRules-meta.xml -> one node per rule,
+    rule_of its object, criteria fields as reads; escalation / auto-response
+    rule files share the shape."""
+    path = _md_file(tmp_path, "assignmentRules/Lead.assignmentRules-meta.xml", """
+<AssignmentRules xmlns="http://soap.sforce.com/2006/04/metadata">
+    <assignmentRule>
+        <fullName>Partner Queue Assignment</fullName>
+        <active>true</active>
+        <ruleEntry>
+            <assignedTo>PartnerQueue</assignedTo>
+            <assignedToType>Queue</assignedToType>
+            <criteriaItems>
+                <field>Lead.Region__c</field>
+                <operation>equals</operation>
+                <value>East</value>
+            </criteriaItems>
+        </ruleEntry>
+        <ruleEntry>
+            <assignedTo>FallbackQueue</assignedTo>
+            <assignedToType>Queue</assignedToType>
+            <criteriaItems>
+                <field>Lead.Region__c</field>
+                <operation>notEqual</operation>
+                <value>East</value>
+            </criteriaItems>
+            <criteriaItems>
+                <field>Account.Type</field>
+                <operation>equals</operation>
+                <value>Partner</value>
+            </criteriaItems>
+        </ruleEntry>
+    </assignmentRule>
+    <assignmentRule>
+        <fullName>Old Assignment</fullName>
+        <active>false</active>
+    </assignmentRule>
+</AssignmentRules>
+""")
+    result = extract_rule_entries(path)
+    _assert_no_dangling_edges(result)
+    rules = {n["sf_qualified_name"]: n for n in result["nodes"]
+             if n["file_type"] == "assignment_rule"}
+    assert set(rules) == {"Lead.Partner Queue Assignment", "Lead.Old Assignment"}
+    active = rules["Lead.Partner Queue Assignment"]
+    assert active["sf_active"] is True
+    assert active["sf_assigned_to"] == ["FallbackQueue", "PartnerQueue"]
+    assert rules["Lead.Old Assignment"]["sf_active"] is False
+    rule_of = [e for e in result["edges"] if e["relation"] == "rule_of"]
+    assert {e["target"] for e in rule_of} == {sobject_nid("Lead")}
+    assert len(rule_of) == 2
+    assert _field_refs_by(result) == {
+        ("Lead", "Region__c", "reads_field"), ("Account", "Type", "reads_field")}
+
+    esc = _md_file(tmp_path, "escalationRules/Case.escalationRules-meta.xml", """
+<EscalationRules xmlns="http://soap.sforce.com/2006/04/metadata">
+    <escalationRule>
+        <fullName>Standard</fullName>
+        <active>true</active>
+    </escalationRule>
+</EscalationRules>
+""")
+    esc_node = next(n for n in extract_rule_entries(esc)["nodes"]
+                    if n["file_type"] == "escalation_rule")
+    assert esc_node["sf_qualified_name"] == "Case.Standard"
+
+
+def test_duplicate_and_matching_rule_parsers(tmp_path: Path) -> None:
+    dup = _md_file(tmp_path, "duplicateRules/Account.Name_Duplicate.duplicateRule-meta.xml", """
+<DuplicateRule xmlns="http://soap.sforce.com/2006/04/metadata" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <actionOnInsert>Allow</actionOnInsert>
+    <actionOnUpdate>Block</actionOnUpdate>
+    <duplicateRuleFilter>
+        <booleanFilter xsi:nil="true"/>
+        <duplicateRuleFilterItems>
+            <field>BusinessUnit__c</field>
+            <operation>equals</operation>
+            <value>Retail</value>
+            <sortOrder>1</sortOrder>
+            <table>Account</table>
+        </duplicateRuleFilterItems>
+    </duplicateRuleFilter>
+    <duplicateRuleMatchRules>
+        <matchRuleSObjectType>Account</matchRuleSObjectType>
+        <matchingRule>Name_Match</matchingRule>
+        <objectMapping xsi:nil="true"/>
+    </duplicateRuleMatchRules>
+    <isActive>true</isActive>
+    <masterLabel>Account Name Duplicate</masterLabel>
+    <sortOrder>1</sortOrder>
+</DuplicateRule>
+""")
+    result = extract_duplicate_rule(dup)
+    _assert_no_dangling_edges(result)
+    node = next(n for n in result["nodes"] if n["file_type"] == "duplicate_rule")
+    assert node["sf_qualified_name"] == "Account.Name_Duplicate"
+    assert node["label"] == "Account Name Duplicate"
+    assert node["sf_active"] is True
+    assert node["sf_action_on_update"] == "Block"
+    uses = next(e for e in result["edges"] if e["relation"] == "uses_matching_rule")
+    stub = next(n for n in result["nodes"] if n["id"] == uses["target"])
+    assert stub["file_type"] == "matching_rule" and stub["sf_stub"] is True
+    assert stub["sf_qualified_name"] == "Account.Name_Match"
+    assert _field_refs_by(result) == {("Account", "BusinessUnit__c", "reads_field")}
+
+    match = _md_file(tmp_path, "matchingRules/Account.matchingRule-meta.xml", """
+<MatchingRules xmlns="http://soap.sforce.com/2006/04/metadata">
+    <matchingRules>
+        <fullName>Name_Match</fullName>
+        <label>Name Match</label>
+        <matchingRuleItems>
+            <blankValueBehavior>NullNotAllowed</blankValueBehavior>
+            <fieldName>Name</fieldName>
+            <matchingMethod>CompanyName</matchingMethod>
+        </matchingRuleItems>
+        <ruleStatus>Active</ruleStatus>
+    </matchingRules>
+</MatchingRules>
+""")
+    m_result = extract_matching_rules(match)
+    _assert_no_dangling_edges(m_result)
+    m_node = next(n for n in m_result["nodes"] if n["file_type"] == "matching_rule")
+    assert m_node["id"] == stub["id"]
+    assert m_node["sf_active"] is True and not m_node.get("sf_stub")
+    assert _field_refs_by(m_result) == {("Account", "Name", "reads_field")}
+
+
+def test_auth_provider_parser_keeps_no_secrets(tmp_path: Path) -> None:
+    path = _md_file(tmp_path, "authproviders/PartnerIdP.authprovider-meta.xml", """
+<AuthProvider xmlns="http://soap.sforce.com/2006/04/metadata">
+    <consumerKey>key-123</consumerKey>
+    <consumerSecret>secret-456</consumerSecret>
+    <friendlyName>Partner IdP</friendlyName>
+    <providerType>OpenIdConnect</providerType>
+    <registrationHandler>PartnerRegHandler</registrationHandler>
+    <tokenUrl>https://idp.example.com/token</tokenUrl>
+</AuthProvider>
+""")
+    result = extract_auth_provider(path)
+    _assert_no_dangling_edges(result)
+    node = next(n for n in result["nodes"] if n["file_type"] == "auth_provider")
+    assert node["sf_qualified_name"] == "PartnerIdP"
+    assert node["label"] == "Partner IdP"
+    assert node["sf_provider_type"] == "OpenIdConnect"
+    text = json.dumps(result)
+    assert "secret-456" not in text and "key-123" not in text
+    handler = next(e for e in result["edges"] if e["relation"] == "apex_handler")
+    assert handler["target"] == apex_nid("PartnerRegHandler")
+
+
+def test_layout_parser(tmp_path: Path) -> None:
+    path = _md_file(tmp_path, "layouts/Account-%28X%29 Account Layout.layout-meta.xml", """
+<Layout xmlns="http://soap.sforce.com/2006/04/metadata">
+    <layoutSections>
+        <layoutColumns>
+            <layoutItems>
+                <behavior>Required</behavior>
+                <field>Name</field>
+            </layoutItems>
+            <layoutItems>
+                <behavior>Edit</behavior>
+                <field>Region__c</field>
+            </layoutItems>
+            <layoutItems>
+                <emptySpace>true</emptySpace>
+            </layoutItems>
+        </layoutColumns>
+    </layoutSections>
+    <relatedLists>
+        <fields>CONTACT.EMAIL</fields>
+        <relatedList>RelatedContactList</relatedList>
+    </relatedLists>
+</Layout>
+""")
+    result = extract_layout(path)
+    _assert_no_dangling_edges(result)
+    node = next(n for n in result["nodes"] if n["file_type"] == "layout")
+    assert node["sf_qualified_name"] == "Account-(X) Account Layout"
+    assert node["sf_object"] == "Account"
+    layout_for = next(e for e in result["edges"] if e["relation"] == "layout_for")
+    assert layout_for["target"] == sobject_nid("Account")
+    refs = {(r["path"], r["sf_behavior"]) for r in result["field_refs"]}
+    assert refs == {("Name", "Required"), ("Region__c", "Edit")}
+    assert {r["relation"] for r in result["field_refs"]} == {"places_field"}
 
 
 def test_permission_set_group_parser(tmp_path: Path) -> None:

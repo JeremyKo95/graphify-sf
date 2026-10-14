@@ -104,6 +104,12 @@ _DML_RE = re.compile(
 _DML_NEW_RE = re.compile(
     r"\b(insert|update|upsert|delete|undelete)\s+new\s+(\w+)\s*\(", re.IGNORECASE
 )
+#: DML on an inline query: ``delete [SELECT Id FROM Obj WHERE ...];`` /
+#: ``Database.delete([SELECT ...])`` — the object is the query's ``FROM``.
+_DML_QUERY_RE = re.compile(
+    r"\b(insert|update|upsert|delete|undelete)\w*\s*\(?\s*\[\s*select\b[^\]]*?\bfrom\s+(\w+)",
+    re.IGNORECASE,
+)
 #: ``Database.update(opps, false)``.
 _DATABASE_DML_RE = re.compile(
     r"\bDatabase\s*\.\s*(insert|update|upsert|delete|undelete)\w*\s*\(\s*(\w+)",
@@ -408,7 +414,8 @@ def _detect_dml_operations(
     """Detect DML statements in stripped *code*.
 
     Returns ``(dml_type, sobject_name, line_no, in_loop, var_typed)``.
-    ``sobject_name`` is read from ``new <Type>(...)``, or resolved from
+    ``sobject_name`` is read from ``new <Type>(...)`` or an inline query's
+    ``FROM``, or resolved from
     variable-type tracking (``var_typed`` — only a candidate until
     ``extract_sf`` confirms it is an SObject), or ``"unknown"``.
     """
@@ -419,8 +426,9 @@ def _detect_dml_operations(
             sobject = var_types.get(match.group(2), "unknown")
             found.append((match.start(), match.group(1).upper(), sobject,
                           sobject != "unknown"))
-    for match in _DML_NEW_RE.finditer(code):
-        found.append((match.start(), match.group(1).upper(), match.group(2), False))
+    for regex in (_DML_NEW_RE, _DML_QUERY_RE):
+        for match in regex.finditer(code):
+            found.append((match.start(), match.group(1).upper(), match.group(2), False))
     results: list[tuple[str, str, int, bool, bool]] = []
     for offset, dml_type, sobject, var_typed in sorted(found):
         line_no = code.count("\n", 0, offset) + 1

@@ -79,6 +79,16 @@ def _normalize_api(api_name: str) -> str:
     return _SOBJECT_ID_DISALLOWED.sub("_", normalized)
 
 
+def metadata_nid(kind: str, *names: str) -> str:
+    """Node ID for a named metadata component: ``<kind>_<name>[.<name>…]``.
+
+    Examples:
+        metadata_nid("layout", "Account-Account Layout") -> "layout_account-account_layout"
+        metadata_nid("duplicate_rule", "Account", "Dup") -> "duplicate_rule_account.dup"
+    """
+    return f"{kind}_{'.'.join(_normalize_api(n) for n in names)}"
+
+
 #: Object segment of a field ID whose owning object could not be determined
 #: (e.g. a CPQ condition naming only a field). ``?`` never survives
 #: ``_normalize_api``, so it cannot collide with a real object.
@@ -143,25 +153,31 @@ GOVERNOR_LIMITS_SYNCED_AT = "2025-03-01"
 # 3. Order of Execution (18 steps)
 # ---------------------------------------------------------------------------
 
-#: Salesforce Order of Execution as (step_number, description, trigger_type).
-#: Used by `order_of_execution.ooe_analysis_pass()` to build the OoE chain for
-#: SObjects that have a real trigger / Before-Save Flow / Validation Rule
-#: (ADR-005, ADR-017).
+#: Salesforce Order of Execution as (step_number, description, component_kind).
+#: Source: Apex Developer Guide, "Triggers and Order of Execution" (checked
+#: against the current guide, 2026-10)
+#: https://developer.salesforce.com/docs/atlas.en-us.apexcode.meta/apexcode/apex_triggers_order_of_execution.htm
+#: Before-save record-triggered flows run BEFORE before-triggers; escalation
+#: rules run before processes and after-save flows. Loading the original record
+#: and grandparent roll-ups are folded into the adjacent steps. The CPQ Calc
+#: Engine is a managed package, not a platform step — see ``sf_cpq_chain``.
+#: ``component_kind`` is what ``ooe_analysis_pass`` attaches to a step with a
+#: ``runs_in`` edge.
 SALESFORCE_OOE_STEPS: list[tuple[int, str, str]] = [
     (1, "System Validation", "system"),
-    (2, "Before Trigger", "apex"),
-    (3, "Custom Validation", "validation_rule"),
-    (4, "Before-Save Flow", "flow"),
-    (5, "CPQ Calc Engine", "cpq"),
-    (6, "Duplicate Rules", "duplicate_rule"),
-    (7, "Database Save (Before Commit)", "system"),
-    (8, "After Trigger", "apex"),
-    (9, "Assignment Rules", "assignment_rule"),
-    (10, "Auto-Response Rules", "auto_response_rule"),
-    (11, "Workflow Rules", "workflow_rule"),
-    (12, "Process Builder", "process_builder"),
-    (13, "After-Save Flow", "flow"),
-    (14, "Escalation Rules", "escalation_rule"),
+    (2, "Before-Save Flow", "flow_before_save"),
+    (3, "Before Trigger", "trigger_before"),
+    (4, "Custom Validation", "validation_rule"),
+    (5, "Duplicate Rules", "duplicate_rule"),
+    (6, "Database Save (Not Committed)", "system"),
+    (7, "After Trigger", "trigger_after"),
+    (8, "Assignment Rules", "assignment_rule"),
+    (9, "Auto-Response Rules", "auto_response_rule"),
+    (10, "Workflow Rules", "workflow_rule"),
+    (11, "Escalation Rules", "escalation_rule"),
+    (12, "Processes (Process Builder)", "process_builder"),
+    (13, "After-Save Flow", "flow_after_save"),
+    (14, "Entitlement Rules", "entitlement_rule"),
     (15, "Roll-Up Summary", "rollup_summary"),
     (16, "Criteria-Based Sharing", "sharing"),
     (17, "Commit DML", "system"),

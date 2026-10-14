@@ -35,10 +35,15 @@ def register():
     from .flow import extract_flow
     from .lwc import extract_lwc_html, extract_lwc_js
     from .metadata import (
+        extract_auth_provider,
         extract_custom_labels,
         extract_custom_metadata_record,
+        extract_duplicate_rule,
+        extract_layout,
+        extract_matching_rules,
         extract_permission_set_group,
         extract_record_type,
+        extract_rule_entries,
         extract_sharing_rules,
         extract_workflow,
     )
@@ -67,6 +72,13 @@ def register():
     _DISPATCH[".html"] = extract_lwc_html
     _DISPATCH[".js"] = extract_lwc_js
     _DISPATCH[".flexipage-meta.xml"] = extract_flexipage
+    _DISPATCH[".assignmentRules-meta.xml"] = extract_rule_entries
+    _DISPATCH[".escalationRules-meta.xml"] = extract_rule_entries
+    _DISPATCH[".autoResponseRules-meta.xml"] = extract_rule_entries
+    _DISPATCH[".duplicateRule-meta.xml"] = extract_duplicate_rule
+    _DISPATCH[".matchingRule-meta.xml"] = extract_matching_rules
+    _DISPATCH[".authprovider-meta.xml"] = extract_auth_provider
+    _DISPATCH[".layout-meta.xml"] = extract_layout
 
 
 def _parser_for(path: Path):
@@ -81,10 +93,15 @@ def _parser_for(path: Path):
     from .flow import extract_flow
     from .lwc import extract_lwc_html, extract_lwc_js
     from .metadata import (
+        extract_auth_provider,
         extract_custom_labels,
         extract_custom_metadata_record,
+        extract_duplicate_rule,
+        extract_layout,
+        extract_matching_rules,
         extract_permission_set_group,
         extract_record_type,
+        extract_rule_entries,
         extract_sharing_rules,
         extract_workflow,
     )
@@ -93,7 +110,12 @@ def _parser_for(path: Path):
         extract_custom_object,
         extract_validation_rule,
     )
-    from .pages import extract_aura_bundle, extract_experience_view, extract_flexipage
+    from .pages import (
+        extract_aura_bundle,
+        extract_experience_site,
+        extract_experience_view,
+        extract_flexipage,
+    )
     from .profiles import extract_permission_set, extract_profile
 
     name = path.name
@@ -123,6 +145,17 @@ def _parser_for(path: Path):
         return extract_permission_set
     if name.endswith(".flexipage-meta.xml"):
         return extract_flexipage
+    for suffix, parser in {
+        ".assignmentRules-meta.xml": extract_rule_entries,
+        ".escalationRules-meta.xml": extract_rule_entries,
+        ".autoResponseRules-meta.xml": extract_rule_entries,
+        ".duplicateRule-meta.xml": extract_duplicate_rule,
+        ".matchingRule-meta.xml": extract_matching_rules,
+        ".authprovider-meta.xml": extract_auth_provider,
+        ".layout-meta.xml": extract_layout,
+    }.items():
+        if name.endswith(suffix):
+            return parser
 
     suffix = path.suffix
     if suffix in (".cls", ".trigger"):
@@ -131,6 +164,8 @@ def _parser_for(path: Path):
     if (suffix == ".json" and path.parent.name == "views"
             and path.parent.parent.parent.name == "experiences"):
         return extract_experience_view
+    if name.endswith(".site-meta.xml") and path.parent.name == "experiences":
+        return extract_experience_site
     # aura/<Bundle>/<Bundle>.cmp|.app — the bundle's markup file.
     if (suffix in (".cmp", ".app") and path.parent.parent.name == "aura"
             and path.stem == path.parent.name):
@@ -345,11 +380,14 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
         2c. ``resolve_field_refs``     — parsers' field references (formulas,
            SOQL, Flow elements, Apex field access) become ``reads_field`` /
            ``writes_field`` edges once every object's metadata is known.
+        2d. ``apex_calls_pass``        — INFERRED ``calls`` edges from Apex
+           classes / triggers to the Apex classes they invoke.
         3. ``ooe_analysis_pass``       — Order of Execution chains.
         4. ``governor_limit_analysis_pass`` — diagnostic ``governor_violation``
            edges (appended to the edge list).
-        5. ``detect_recursive_triggers`` — recursive ``calls`` cycles as
-           ``governor_violation`` edges, guarded recursion downgraded (ADR-027).
+        5. ``detect_recursive_triggers`` — recursive ``calls`` cycles, including
+           re-entry through DML on a triggered object, as ``governor_violation``
+           edges, guarded recursion downgraded (ADR-027).
         6. ``permission_analysis_pass`` — Profile/FLS constraints on CPQ
            (``gov_permission_violation`` edges, ADR-028). Runs after CPQ so
            ``file_type == "cpq_rule"`` / ``sf_cpq_object`` are already set.
@@ -378,6 +416,7 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
         ``{"nodes": [...], "edges": [...]}`` — the merged, analyzed graph, with
         ``source_file`` values relative to *path* (its parent for a single file).
     """
+    from .apex_calls import apex_calls_pass
     from .cpq import cpq_analysis_pass
     from .field_refs import resolve_field_refs
     from .pages import resolve_hosted_components
@@ -438,6 +477,7 @@ def extract_sf(path, *, cpq_data_dir=None, include_permissions=False, **kwargs):
     _resolve_unqualified_fields(all_nodes, all_edges)
     _confirm_var_typed_dml(all_nodes, all_edges)
     resolve_field_refs(all_nodes, all_edges, field_refs)
+    apex_calls_pass(all_nodes, all_edges)
     ooe_analysis_pass(all_nodes, all_edges)
     all_edges.extend(governor_limit_analysis_pass(all_nodes, all_edges))
     all_edges.extend(detect_recursive_triggers(all_nodes, all_edges))

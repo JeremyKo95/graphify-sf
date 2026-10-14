@@ -45,6 +45,14 @@ SF_FILE_TYPES = {
     "custom_label",         # Custom Label ($Label.X reference target)
     "flexipage",            # Lightning App / Record / Home page
     "experience_page",      # Experience Cloud view (<site>/<view>)
+    "experience_site",      # Experience Cloud site (experiences/<site>)
+    "layout",               # Page Layout (<Obj>-<Layout Name>)
+    "assignment_rule",      # Assignment Rule (assignmentRules/<Obj>)
+    "escalation_rule",      # Escalation Rule (escalationRules/<Obj>)
+    "auto_response_rule",   # Auto-Response Rule (autoResponseRules/<Obj>)
+    "duplicate_rule",       # Duplicate Rule (duplicateRules/<Obj>.<Rule>)
+    "matching_rule",        # Matching Rule (matchingRules/<Obj>)
+    "auth_provider",        # Auth Provider (authproviders/<Name>)
 }
 
 
@@ -57,6 +65,7 @@ SF_RELATIONS = {
     "triggers_on",          # Apex Trigger / record-triggered Flow -> SObject
     "member_of",            # Apex method -> owning class
     "implements",           # Apex class -> interface (e.g. SBQQ QCP)
+    "calls",                # Apex class / trigger -> Apex class it invokes (INFERRED)
     "queries",              # SOQL site -> SObject
     "dml_operates_on",      # DML site -> SObject
 
@@ -71,6 +80,9 @@ SF_RELATIONS = {
     "hosts",                # FlexiPage / Experience page -> LWC / Aura component
     "page_for",             # Record FlexiPage -> SObject
     "aura_controller",      # Aura bundle -> Apex controller class
+    "contains",             # Experience site -> its pages
+    "layout_for",           # Page Layout -> SObject
+    "places_field",         # Page Layout -> Field placed on it
 
     # Permission
     "grants_access_to",     # Profile/PermSet -> Object/Field
@@ -85,6 +97,9 @@ SF_RELATIONS = {
     "cmt_record_of",        # Custom Metadata record -> <Type>__mdt SObject
     "shares",               # Sharing Rule -> SObject
     "maps_to",              # field -> field (Custom Metadata field-mapping record)
+    "rule_of",              # Assignment / Escalation / Auto-Response / Duplicate / Matching rule -> SObject
+    "uses_matching_rule",   # Duplicate Rule -> Matching Rule
+    "apex_handler",         # Auth Provider -> registration handler / plugin Apex class
 
     # CPQ
     "cpq_applies_to",       # CPQ Rule/QCP -> target object
@@ -95,6 +110,7 @@ SF_RELATIONS = {
 
     # Order of Execution
     "order_of_execution",   # OoE Step N -> Step N+1 (DAG)
+    "runs_in",              # Trigger / Flow / rule -> the OoE step it runs in
 
     # Diagnostics
     "governor_violation",       # Method -> Governor Limit sentinel
